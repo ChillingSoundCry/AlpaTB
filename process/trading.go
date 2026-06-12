@@ -42,8 +42,8 @@ type Config struct {
 }
 
 func LoadConfig() Config {
-	apiKey := strings.TrimSpace(os.Getenv("APCA_API_KEY_ID"))
-	apiSecret := strings.TrimSpace(os.Getenv("APCA_API_SECRET_KEY"))
+	apiKey := "PKZAHMV7MKL6ZSDXWZG7CJ7IZO"                      //strings.TrimSpace(os.Getenv("APCA_API_KEY_ID"))
+	apiSecret := "CkJvxb51vdkZjRgBGDLvzDrzEjSCPkv9p6VGga9vbAiX" //strings.TrimSpace(os.Getenv("APCA_API_SECRET_KEY"))
 	if apiKey == "" || apiSecret == "" {
 		log.Fatal("missing APCA_API_KEY_ID or APCA_API_SECRET_KEY environment variables")
 	}

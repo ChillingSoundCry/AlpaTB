@@ -680,3 +680,15 @@
 {"level":"info","ts":"2026-06-12T15:30:30.087Z","caller":"logger/log.go:27","msg":"entery AuthChallenge"}
 {"level":"info","ts":"2026-06-12T15:30:30.131Z","caller":"logger/log.go:27","msg":"entery AuthVerify"}
 {"level":"info","ts":"2026-06-12T15:30:30.173Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:32:11.196Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T15:34:26.139Z","caller":"logger/log.go:27","msg":"entery AuthChallenge"}
+{"level":"info","ts":"2026-06-12T15:34:26.179Z","caller":"logger/log.go:27","msg":"entery AuthVerify"}
+{"level":"info","ts":"2026-06-12T15:34:26.219Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:35:53.342Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:35:59.882Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:36:16.038Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:37:31.402Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:37:36.214Z","caller":"logger/log.go:27","msg":"entery AuthChallenge"}
+{"level":"info","ts":"2026-06-12T15:37:40.913Z","caller":"logger/log.go:27","msg":"entery AuthChallenge"}
+{"level":"info","ts":"2026-06-12T15:37:40.955Z","caller":"logger/log.go:27","msg":"entery AuthVerify"}
+{"level":"info","ts":"2026-06-12T15:37:40.997Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
