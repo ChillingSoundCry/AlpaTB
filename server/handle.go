@@ -167,6 +167,16 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
+	msk := r.Header.Get("X-MSK")
+
+	if msk == "" {
+		http.Error(w, "Missing MSK", http.StatusUnauthorized)
+		return
+	} else if !globalCache.MskExists(msk) {
+		http.Error(w, "MSK Expired", http.StatusUnauthorized)
+		return
+	}
+
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -725,6 +735,15 @@ type BarView struct {
 
 func GetBarsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	msk := r.Header.Get("X-MSK")
+
+	if msk == "" {
+		http.Error(w, "Missing MSK", http.StatusUnauthorized)
+		return
+	} else if !globalCache.MskExists(msk) {
+		http.Error(w, "MSK Expired", http.StatusUnauthorized)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -758,6 +777,15 @@ func GetBarsHandler(w http.ResponseWriter, r *http.Request) {
 
 func LiquidateHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	msk := r.Header.Get("X-MSK")
+
+	if msk == "" {
+		http.Error(w, "Missing MSK", http.StatusUnauthorized)
+		return
+	} else if !globalCache.MskExists(msk) {
+		http.Error(w, "MSK Expired", http.StatusUnauthorized)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -785,6 +813,15 @@ func LiquidateHandler(w http.ResponseWriter, r *http.Request) {
 
 func RestartHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	msk := r.Header.Get("X-MSK")
+
+	if msk == "" {
+		http.Error(w, "Missing MSK", http.StatusUnauthorized)
+		return
+	} else if !globalCache.MskExists(msk) {
+		http.Error(w, "MSK Expired", http.StatusUnauthorized)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return

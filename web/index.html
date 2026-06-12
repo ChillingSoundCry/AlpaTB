@@ -7,6 +7,7 @@
     <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
     <script>
         tailwind.config = {
             theme: {
@@ -27,20 +28,136 @@
         };
     </script>
     <style>
-        html, body { margin: 0; padding: 0; min-height: 100vh; background: #f1f5f9; background-attachment: fixed; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif; }
-        body::before { content: ''; position: fixed; inset: 0; z-index: 0; pointer-events: none; background: radial-gradient(ellipse 80% 60% at 20% 15%, rgba(139,92,246,0.06) 0%, transparent 55%), radial-gradient(ellipse 60% 50% at 75% 80%, rgba(6,182,212,0.05) 0%, transparent 55%); background-attachment: fixed; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            background: #f1f5f9;
+            background-attachment: fixed;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif;
+        }
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            background:
+                radial-gradient(ellipse 80% 60% at 20% 15%, rgba(139,92,246,0.06) 0%, transparent 55%),
+                radial-gradient(ellipse 60% 50% at 75% 80%, rgba(6,182,212,0.05) 0%, transparent 55%);
+            background-attachment: fixed;
+        }
         #app { position: relative; z-index: 1; }
-        .glass { background: rgba(255,255,255,0.78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.55); box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.03); }
+        [v-cloak] { display: none; }
+        .glass {
+            background: rgba(255,255,255,0.78);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border: 1px solid rgba(255,255,255,0.55);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.03);
+        }
         .card-hover { transition: all 0.22s; cursor: pointer; }
         .card-hover:hover { transform: translateY(-3px); box-shadow: 0 14px 36px -12px rgba(124,58,237,0.18); }
         .fade-in { animation: fadeSlideIn 0.28s; }
-        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(16px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        @keyframes fadeSlideIn {
+            from { opacity: 0; transform: translateY(16px) scale(0.98); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
         .scrollbar-thin::-webkit-scrollbar { width: 5px; }
         .scrollbar-thin::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
+
+        /* Auth styles */
+        .auth-mask {
+            position: fixed;
+            inset: 0;
+            z-index: 99999;
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+            background: rgba(15, 23, 42, .35);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+        .auth-card {
+            width: 420px;
+            max-width: 100%;
+            background: rgba(255, 255, 255, .96);
+            border: 1px solid rgba(255, 255, 255, .65);
+            border-radius: 30px;
+            padding: 40px;
+            box-shadow: 0 30px 80px rgba(0, 0, 0, .18);
+        }
+        .auth-card h2 {
+            font-size: 24px;
+            font-weight: 900;
+            color: #0f172a;
+            text-align: center;
+        }
+        .auth-card p {
+            color: #64748b;
+            font-size: 13px;
+            text-align: center;
+            margin-top: 8px;
+        }
+        .auth-card input {
+            width: 100%;
+            margin-top: 18px;
+            padding: 14px 16px;
+            border: 1px solid #cbd5e1;
+            border-radius: 14px;
+            outline: none;
+            font-size: 14px;
+        }
+        .auth-card input:focus {
+            border-color: var(--brand-primary, #7C3AED);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, .12);
+        }
+        .auth-card button {
+            width: 100%;
+            margin-top: 16px;
+            padding: 14px 16px;
+            border: none;
+            border-radius: 14px;
+            background: #7C3AED;
+            color: #fff;
+            font-weight: 800;
+            cursor: pointer;
+            transition: opacity .2s, transform .05s, background-color .2s;
+        }
+        .auth-card button:hover { background: #6D28D9; }
+        .auth-card button:active { transform: translateY(1px); }
+        .auth-card button:disabled { opacity: .5; cursor: not-allowed; }
+        .auth-error {
+            margin-top: 14px;
+            color: #ef4444;
+            font-size: 13px;
+            font-weight: 700;
+            text-align: center;
+            min-height: 18px;
+        }
     </style>
 </head>
 <body class="text-slate-800 antialiased">
-    <div id="app" class="min-h-screen flex flex-col">
+    <div id="app" class="min-h-screen flex flex-col" v-cloak>
+        <!-- 鉴权遮罩 -->
+        <div v-if="showAuthMask" class="auth-mask">
+            <div class="auth-card">
+                <h2>Secure Authentication</h2>
+                <p>This page requires password verification</p>
+                <input
+                    v-model="authPassword"
+                    type="password"
+                    placeholder="Enter password"
+                    @keyup.enter="startAuth"
+                />
+                <button @click="startAuth" :disabled="authLoading">
+                    {{ authLoading ? 'Authenticating...' : 'Authenticate' }}
+                </button>
+                <div class="auth-error">{{ authError }}</div>
+            </div>
+        </div>
+
         <header class="sticky top-0 z-40 bg-white/82 backdrop-blur-lg border-b border-slate-200/50 shadow-sm">
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                 <div class="h-16 flex items-center justify-between">
@@ -63,13 +180,13 @@
                             </span>
                             {{ dashboard.account.status === 'running' ? '运行中' : '已停止' }}
                         </div>
-                        <button @click="liquidateAll" class="px-3 py-2 rounded-lg bg-rose-600 text-white text-sm font-medium hover:bg-rose-700 transition shadow-sm active:scale-95" :disabled="liquidating">
+                        <button @click="liquidateAll" class="px-3 py-2 rounded-lg bg-rose-600 text-white text-sm font-medium hover:bg-rose-700 transition shadow-sm active:scale-95" :disabled="liquidating || !authPassed">
                             {{ liquidating ? '平仓中...' : '一键平仓' }}
                         </button>
-                        <button @click="restartBot" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95" :disabled="restarting">
+                        <button @click="restartBot" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95" :disabled="restarting || !authPassed">
                             {{ restarting ? '重启中...' : '重启机器人' }}
                         </button>
-                        <button @click="loadDashboard" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95">刷新数据</button>
+                        <button @click="loadDashboard" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95" :disabled="!authPassed">刷新数据</button>
                     </div>
                 </div>
             </div>
@@ -371,8 +488,13 @@
     </div>
 
     <script>
-        const { createApp, ref, onMounted, nextTick } = Vue;
-        const API_BASE = '';
+        const { createApp, ref, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
+        const API_BASE = window.location.origin;
+        const CHALLENGE_API = `${API_BASE}/api/auth/challenge`;
+        const VERIFY_API = `${API_BASE}/api/auth/verify`;
+        const SESSION_CHECK_API = `${API_BASE}/api/whiteBoardNodes`;
+        const SESSION_KEY = 'MSK';
+        const SESSION_EXPIRE_MS = 18 * 60 * 1000;
 
         createApp({
             setup() {
@@ -381,6 +503,13 @@
                 const restarting = ref(false);
                 const strategyChartLoading = ref(false);
                 const strategyBarsCount = ref(0);
+
+                const authPassed = ref(false);
+                const authLoading = ref(false);
+                const authError = ref('');
+                const authPassword = ref('');
+                const MSK = ref('');
+
                 const dashboard = ref({
                     account: { status: 'stopped' },
                     performance: {},
@@ -392,10 +521,15 @@
                     errors: [],
                     updatedAt: ''
                 });
+
                 const allTrades = ref([]);
                 const selectedStrategy = ref(null);
                 let equityChart = null;
                 let strategyChart = null;
+                let authTimer = null;
+                let refreshingLock = false;
+
+                const showAuthMask = computed(() => !authPassed.value);
 
                 const normalizeStatus = (status) => String(status || '').trim().toLowerCase();
 
@@ -426,20 +560,167 @@
                     if (!iso) return '--';
                     const d = new Date(iso);
                     if (isNaN(d.getTime())) return '--';
-                    return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+                    return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${(d.getHours()).toString().padStart(2,'0')}:${(d.getMinutes()).toString().padStart(2,'0')}`;
                 };
 
                 const formatTimestamp = (ts) => {
                     const d = new Date(ts * 1000);
                     if (isNaN(d.getTime())) return '--';
-                    return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+                    return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${(d.getHours()).toString().padStart(2,'0')}:${(d.getMinutes()).toString().padStart(2,'0')}`;
                 };
 
+                function hmacSHA256(key, message) {
+                    return CryptoJS.HmacSHA256(message, key).toString(CryptoJS.enc.Hex);
+                }
+
+                function stopAuthTimer() {
+                    if (authTimer) {
+                        clearTimeout(authTimer);
+                        authTimer = null;
+                    }
+                }
+
+                function scheduleExpireSession() {
+                    stopAuthTimer();
+                    authTimer = setTimeout(expireSession, SESSION_EXPIRE_MS);
+                }
+
+                function expireSession() {
+                    sessionStorage.removeItem(SESSION_KEY);
+                    MSK.value = '';
+                    authPassed.value = false;
+                    authError.value = 'Session expired, please authenticate again';
+                    stopAuthTimer();
+
+                    dashboard.value = {
+                        account: { status: 'stopped' },
+                        performance: {},
+                        positions: [],
+                        strategies: [],
+                        latest_prices: {},
+                        meta: {},
+                        snapshots: [],
+                        errors: [],
+                        updatedAt: ''
+                    };
+                    allTrades.value = [];
+                    selectedStrategy.value = null;
+                    if (equityChart) {
+                        try { equityChart.dispose(); } catch (e) {}
+                        equityChart = null;
+                    }
+                    if (strategyChart) {
+                        try { strategyChart.dispose(); } catch (e) {}
+                        strategyChart = null;
+                    }
+                }
+
+                async function startAuth() {
+                    authError.value = '';
+                    if (!authPassword.value) {
+                        authError.value = 'Password required';
+                        return;
+                    }
+
+                    authLoading.value = true;
+                    try {
+                        const challengeRes = await fetch(CHALLENGE_API, { method: 'GET', mode: 'cors' });
+                        if (!challengeRes.ok) throw new Error(`Challenge failed: ${challengeRes.status}`);
+                        const { rand, autn } = await challengeRes.json();
+
+                        const timeBucket = Math.floor(Math.floor(Date.now() / 1000) / 60);
+                        if (hmacSHA256(authPassword.value, authPassword.value + rand + timeBucket) !== autn) {
+                            throw new Error('AUTN verification failed');
+                        }
+
+                        const res = hmacSHA256(authPassword.value, authPassword.value + rand);
+                        const verifyRes = await fetch(VERIFY_API, {
+                            method: 'POST',
+                            mode: 'cors',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ res })
+                        });
+
+                        if (!verifyRes.ok) throw new Error(`Verify failed: ${verifyRes.status}`);
+                        const json = await verifyRes.json();
+                        if (json.code !== 200) throw new Error('Authentication failed');
+
+                        MSK.value = json.msk;
+                        sessionStorage.setItem(SESSION_KEY, json.msk);
+                        authPassed.value = true;
+                        scheduleExpireSession();
+                        authPassword.value = '';
+                        await loadDashboard();
+                    } catch (e) {
+                        authError.value = e?.message || 'Authentication error';
+                    } finally {
+                        authLoading.value = false;
+                    }
+                }
+
+                async function fetchAuthSession() {
+                    const saved = sessionStorage.getItem(SESSION_KEY);
+                    if (!saved) return;
+                    MSK.value = saved;
+
+                    try {
+                        const res = await fetch(SESSION_CHECK_API, {
+                            mode: 'cors',
+                            headers: { 'X-MSK': MSK.value }
+                        });
+
+                        if (res.status === 401 || res.status === 403) {
+                            expireSession();
+                            return;
+                        }
+
+                        if (!res.ok) return;
+
+                        const json = await res.json();
+                        if (json.code === 200) {
+                            authPassed.value = true;
+                            scheduleExpireSession();
+                            await loadDashboard();
+                        }
+                    } catch (e) {
+                        authPassed.value = true;
+                        scheduleExpireSession();
+                        await loadDashboard();
+                    }
+                }
+
+                async function authedFetch(url, options = {}) {
+                    const headers = new Headers(options.headers || {});
+                    if (MSK.value) headers.set('X-MSK', MSK.value);
+
+                    const hasBody = typeof options.body !== 'undefined' && options.body !== null;
+                    if (hasBody && !headers.has('Content-Type') && !(options.body instanceof FormData)) {
+                        headers.set('Content-Type', 'application/json');
+                    }
+
+                    const res = await fetch(url, {
+                        ...options,
+                        headers,
+                        mode: options.mode || 'cors'
+                    });
+
+                    if (res.status === 401 || res.status === 403) {
+                        expireSession();
+                        throw new Error('Unauthorized or session expired');
+                    }
+
+                    return res;
+                }
+
                 const loadDashboard = async () => {
+                    if (!authPassed.value || refreshingLock) return;
+                    refreshingLock = true;
                     loading.value = true;
                     try {
-                        const res = await fetch(`${API_BASE}/api/dashboard`);
+                        const res = await authedFetch(`${API_BASE}/api/dashboard`);
+                        if (!res.ok) throw new Error(await res.text());
                         const data = await res.json();
+
                         dashboard.value.account = data.account || { status: 'stopped' };
                         dashboard.value.performance = data.performance || {};
                         dashboard.value.positions = data.positions || [];
@@ -449,15 +730,20 @@
                         dashboard.value.errors = data.errors || [];
                         dashboard.value.updatedAt = data.updated_at || '';
                         dashboard.value.strategies = data.strategies || [];
+
                         const trades = [];
                         if (data.trades_by_strategy) {
-                            Object.values(data.trades_by_strategy).forEach(g => trades.push(...g.trades));
+                            Object.values(data.trades_by_strategy).forEach(g => trades.push(...(g.trades || [])));
                         }
                         allTrades.value = trades.sort((a, b) => new Date(b.time) - new Date(a.time));
+
+                        await nextTick();
+                        renderEquityChart();
                     } catch (e) {
                         console.error(e);
                     } finally {
                         loading.value = false;
+                        refreshingLock = false;
                     }
                 };
 
@@ -474,29 +760,42 @@
                         xAxis: { data: xData, axisLabel: { fontSize: 10, rotate: xData.length > 15 ? 30 : 0 } },
                         yAxis: { scale: true, axisLabel: { fontSize: 10, formatter: (v) => '$' + Number(v || 0).toFixed(2) } },
                         series: [{
-                            data: yData, type: 'line', smooth: 0.3,
-                            areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(139,92,246,0.25)' }, { offset: 1, color: 'rgba(139,92,246,0.02)' }]) },
-                            lineStyle: { color: '#7C3AED', width: 2 }, itemStyle: { color: '#7C3AED' },
-                            symbol: 'circle', symbolSize: 4
+                            data: yData,
+                            type: 'line',
+                            smooth: 0.3,
+                            areaStyle: {
+                                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: 'rgba(139,92,246,0.25)' },
+                                    { offset: 1, color: 'rgba(139,92,246,0.02)' }
+                                ])
+                            },
+                            lineStyle: { color: '#7C3AED', width: 2 },
+                            itemStyle: { color: '#7C3AED' },
+                            symbol: 'circle',
+                            symbolSize: 4
                         }]
                     });
                 };
 
-                const openStrategy = (strategy) => {
+                const openStrategy = async (strategy) => {
                     selectedStrategy.value = strategy;
                     strategyBarsCount.value = 0;
-                    nextTick(() => renderStrategyChart(strategy));
+                    await nextTick();
+                    renderStrategyChart(strategy);
                 };
 
                 const closeStrategy = () => {
                     selectedStrategy.value = null;
                     strategyBarsCount.value = 0;
-                    if (strategyChart) { strategyChart.dispose(); strategyChart = null; }
+                    if (strategyChart) {
+                        strategyChart.dispose();
+                        strategyChart = null;
+                    }
                 };
 
                 const fetchBars = async (symbol) => {
                     try {
-                        const res = await fetch(`${API_BASE}/api/bars?symbol=${symbol}`);
+                        const res = await authedFetch(`${API_BASE}/api/bars?symbol=${encodeURIComponent(symbol)}`);
                         if (!res.ok) return null;
                         const data = await res.json();
                         if (Array.isArray(data) && data.length > 0) {
@@ -511,12 +810,22 @@
                 const renderStrategyChart = async (strategy) => {
                     const dom = document.getElementById('strategy-chart');
                     if (!dom) return;
-                    if (strategyChart) { strategyChart.dispose(); strategyChart = null; }
+                    if (strategyChart) {
+                        strategyChart.dispose();
+                        strategyChart = null;
+                    }
                     strategyChart = echarts.init(dom);
                     const trades = strategy.trades || [];
 
                     if (trades.length === 0 && !strategy.symbol) {
-                        strategyChart.setOption({ title: { text: '无成交记录', left: 'center', top: 'center', textStyle: { color: '#94a3b8', fontSize: 14 } } });
+                        strategyChart.setOption({
+                            title: {
+                                text: '无成交记录',
+                                left: 'center',
+                                top: 'center',
+                                textStyle: { color: '#94a3b8', fontSize: 14 }
+                            }
+                        });
                         strategyBarsCount.value = 0;
                         return;
                     }
@@ -533,55 +842,97 @@
                         strategyBarsCount.value = bars.length;
                         xData = bars.map(b => formatTimestamp(b.t));
                         yData = bars.map(b => Number((b.c || 0).toFixed(2)));
-                        const buyMarks = [], sellMarks = [];
+
+                        const buyMarks = [];
+                        const sellMarks = [];
                         trades.forEach(t => {
                             const tTime = new Date(t.time).getTime();
                             let idx = 0, minDiff = Infinity;
                             bars.forEach((b, i) => {
                                 const barTime = (b.t || 0) * 1000;
                                 const diff = Math.abs(barTime - tTime);
-                                if (diff < minDiff) { minDiff = diff; idx = i; }
+                                if (diff < minDiff) {
+                                    minDiff = diff;
+                                    idx = i;
+                                }
                             });
+
                             if (minDiff <= 4 * 3600 * 1000) {
                                 const tradePrice = Number(Number(t.price || 0).toFixed(2));
                                 const point = {
-                                    coord: [idx, tradePrice], value: tradePrice,
-                                    symbol: 'pin', symbolSize: 40, symbolOffset: [0, -8],
-                                    label: { show: true, fontSize: 10, fontWeight: 'bold', formatter: t.side === 'buy' ? 'B' : 'S', color: '#fff', position: 'inside' },
-                                    tooltip: { formatter: () => `${t.side==='buy'?'买入':'卖出'}<br/>时间: ${formatTimestamp(bars[idx].t)}<br/>价格: $${tradePrice.toFixed(2)}<br/>数量: ${t.qty||'--'} 股` }
+                                    coord: [idx, tradePrice],
+                                    value: tradePrice,
+                                    symbol: 'pin',
+                                    symbolSize: 40,
+                                    symbolOffset: [0, -8],
+                                    label: {
+                                        show: true,
+                                        fontSize: 10,
+                                        fontWeight: 'bold',
+                                        formatter: t.side === 'buy' ? 'B' : 'S',
+                                        color: '#fff',
+                                        position: 'inside'
+                                    },
+                                    tooltip: {
+                                        formatter: () => `${t.side==='buy'?'买入':'卖出'}<br/>时间: ${formatTimestamp(bars[idx].t)}<br/>价格: $${tradePrice.toFixed(2)}<br/>数量: ${t.qty||'--'} 股`
+                                    }
                                 };
+
                                 if (t.side === 'buy') {
                                     point.itemStyle = { color: '#059669', borderColor: '#fff', borderWidth: 1.5 };
-                                    point.label.backgroundColor = '#059669'; point.label.borderRadius = 3; point.label.padding = [2,5];
+                                    point.label.backgroundColor = '#059669';
+                                    point.label.borderRadius = 3;
+                                    point.label.padding = [2,5];
                                     buyMarks.push(point);
                                 } else {
                                     point.itemStyle = { color: '#dc2626', borderColor: '#fff', borderWidth: 1.5 };
-                                    point.label.backgroundColor = '#dc2626'; point.label.borderRadius = 3; point.label.padding = [2,5];
+                                    point.label.backgroundColor = '#dc2626';
+                                    point.label.borderRadius = 3;
+                                    point.label.padding = [2,5];
                                     sellMarks.push(point);
                                 }
                             }
                         });
+
                         markPoints = [...buyMarks, ...sellMarks];
                         chartTitle = mainSymbol + ' 小时K线';
                     } else {
                         strategyBarsCount.value = 0;
-                        const sortedTrades = [...trades].sort((a,b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+                        const sortedTrades = [...trades].sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
                         xData = sortedTrades.map(t => formatTime(t.time));
                         yData = sortedTrades.map(t => Number(Number(t.price || 0).toFixed(2)));
-                        markPoints = sortedTrades.map((t,i) => ({
+                        markPoints = sortedTrades.map((t, i) => ({
                             coord: [i, Number(Number(t.price || 0).toFixed(2))],
                             value: Number(Number(t.price || 0).toFixed(2)),
-                            symbol: 'pin', symbolSize: 40, symbolOffset: [0,-8],
-                            label: { show: true, fontSize: 10, fontWeight: 'bold', formatter: t.side==='buy'?'B':'S', color: '#fff', position: 'inside' },
-                            tooltip: { formatter: () => `${t.side==='buy'?'买入':'卖出'}<br/>时间: ${formatTime(t.time)}<br/>价格: $${Number(t.price||0).toFixed(2)}<br/>数量: ${t.qty||'--'} 股` },
-                            itemStyle: { color: t.side==='buy'?'#059669':'#dc2626', borderColor: '#fff', borderWidth: 1.5 },
-                            label: { show: true, fontSize: 10, fontWeight: 'bold', formatter: t.side==='buy'?'B':'S', color: '#fff', position: 'inside', backgroundColor: t.side==='buy'?'#059669':'#dc2626', borderRadius: 3, padding: [2,5] }
+                            symbol: 'pin',
+                            symbolSize: 40,
+                            symbolOffset: [0,-8],
+                            label: {
+                                show: true,
+                                fontSize: 10,
+                                fontWeight: 'bold',
+                                formatter: t.side==='buy'?'B':'S',
+                                color: '#fff',
+                                position: 'inside',
+                                backgroundColor: t.side==='buy'?'#059669':'#dc2626',
+                                borderRadius: 3,
+                                padding: [2,5]
+                            },
+                            tooltip: {
+                                formatter: () => `${t.side==='buy'?'买入':'卖出'}<br/>时间: ${formatTime(t.time)}<br/>价格: $${Number(t.price||0).toFixed(2)}<br/>数量: ${t.qty||'--'} 股`
+                            },
+                            itemStyle: { color: t.side==='buy'?'#059669':'#dc2626', borderColor: '#fff', borderWidth: 1.5 }
                         }));
                         chartTitle = mainSymbol + ' 成交点位';
                     }
 
                     const option = {
-                        title: chartTitle ? { text: chartTitle, left: 'center', top: 0, textStyle: { fontSize: 12, color: '#64748b', fontWeight: 'normal' } } : undefined,
+                        title: chartTitle ? {
+                            text: chartTitle,
+                            left: 'center',
+                            top: 0,
+                            textStyle: { fontSize: 12, color: '#64748b', fontWeight: 'normal' }
+                        } : undefined,
                         tooltip: {
                             trigger: 'axis',
                             formatter: (params) => {
@@ -602,23 +953,50 @@
                             }
                         },
                         grid: { left: '8%', right: '8%', top: chartTitle ? '14%' : '10%', bottom: '12%' },
-                        xAxis: { data: xData, axisLabel: { fontSize: 10, rotate: xData.length > 12 ? 35 : 0, interval: xData.length > 20 ? Math.floor(xData.length / 12) : 0 } },
-                        yAxis: { scale: true, axisLabel: { fontSize: 10, formatter: (v) => '$' + Number(v || 0).toFixed(2) }, splitLine: { lineStyle: { color: '#f1f5f9', type: 'dashed' } } },
+                        xAxis: {
+                            data: xData,
+                            axisLabel: {
+                                fontSize: 10,
+                                rotate: xData.length > 12 ? 35 : 0,
+                                interval: xData.length > 20 ? Math.floor(xData.length / 12) : 0
+                            }
+                        },
+                        yAxis: {
+                            scale: true,
+                            axisLabel: { fontSize: 10, formatter: (v) => '$' + Number(v || 0).toFixed(2) },
+                            splitLine: { lineStyle: { color: '#f1f5f9', type: 'dashed' } }
+                        },
                         series: [{
-                            data: yData, type: 'line', smooth: 0.3,
-                            symbol: 'circle', symbolSize: 4,
-                            lineStyle: { color: '#6366f1', width: 2 }, itemStyle: { color: '#6366f1' },
-                            areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1, [{ offset: 0, color: 'rgba(99,102,241,0.18)' }, { offset: 1, color: 'rgba(99,102,241,0.02)' }]) },
+                            data: yData,
+                            type: 'line',
+                            smooth: 0.3,
+                            symbol: 'circle',
+                            symbolSize: 4,
+                            lineStyle: { color: '#6366f1', width: 2 },
+                            itemStyle: { color: '#6366f1' },
+                            areaStyle: {
+                                color: new echarts.graphic.LinearGradient(0,0,0,1, [
+                                    { offset: 0, color: 'rgba(99,102,241,0.18)' },
+                                    { offset: 1, color: 'rgba(99,102,241,0.02)' }
+                                ])
+                            },
                             markPoint: { data: markPoints, animation: true, animationDuration: 300 }
                         }]
                     };
+
                     strategyChart.setOption(option);
+
                     if (markPoints.length > 0 && yData.length > 0) {
                         const allPrices = [...yData, ...markPoints.map(m => m.value)].filter(v => !isNaN(v));
                         const minPrice = Math.min(...allPrices);
                         const maxPrice = Math.max(...allPrices);
                         const padding = (maxPrice - minPrice) * 0.08 || 1;
-                        strategyChart.setOption({ yAxis: { min: Math.floor((minPrice - padding) * 100) / 100, max: Math.ceil((maxPrice + padding) * 100) / 100 } });
+                        strategyChart.setOption({
+                            yAxis: {
+                                min: Math.floor((minPrice - padding) * 100) / 100,
+                                max: Math.ceil((maxPrice + padding) * 100) / 100
+                            }
+                        });
                     }
                 };
 
@@ -629,10 +1007,11 @@
                 window.addEventListener('resize', handleAllResize);
 
                 const liquidateAll = async () => {
+                    if (!authPassed.value) return;
                     if (!confirm('确认平仓所有持仓并取消全部挂单？')) return;
                     liquidating.value = true;
                     try {
-                        const res = await fetch(`${API_BASE}/api/liquidate`, { method: 'POST' });
+                        const res = await authedFetch(`${API_BASE}/api/liquidate`, { method: 'POST' });
                         if (!res.ok) throw new Error(await res.text());
                         await loadDashboard();
                     } catch (e) {
@@ -643,10 +1022,11 @@
                 };
 
                 const restartBot = async () => {
+                    if (!authPassed.value) return;
                     if (!confirm('确认重启机器人？')) return;
                     restarting.value = true;
                     try {
-                        const res = await fetch(`${API_BASE}/api/restart`, { method: 'POST' });
+                        const res = await authedFetch(`${API_BASE}/api/restart`, { method: 'POST' });
                         if (!res.ok) throw new Error(await res.text());
                         await loadDashboard();
                     } catch (e) {
@@ -656,16 +1036,52 @@
                     }
                 };
 
+                watch(authPassed, (v) => {
+                    if (!v) {
+                        stopAuthTimer();
+                        selectedStrategy.value = null;
+                    }
+                });
+
                 onMounted(() => {
-                    loadDashboard().then(() => nextTick(renderEquityChart));
+                    fetchAuthSession();
+                });
+
+                onUnmounted(() => {
+                    stopAuthTimer();
+                    window.removeEventListener('resize', handleAllResize);
+                    try { if (equityChart) equityChart.dispose(); } catch (e) {}
+                    try { if (strategyChart) strategyChart.dispose(); } catch (e) {}
                 });
 
                 return {
-                    loading, liquidating, restarting, strategyChartLoading, strategyBarsCount,
-                    dashboard, allTrades, selectedStrategy,
-                    formatNumber, formatPrice, formatCurrency, formatSignedCurrency, formatSignedPercent,
-                    colorClass, formatTime, normalizeStatus,
-                    loadDashboard, openStrategy, closeStrategy, liquidateAll, restartBot
+                    loading,
+                    liquidating,
+                    restarting,
+                    strategyChartLoading,
+                    strategyBarsCount,
+                    dashboard,
+                    allTrades,
+                    selectedStrategy,
+                    authPassed,
+                    authLoading,
+                    authError,
+                    authPassword,
+                    showAuthMask,
+                    formatNumber,
+                    formatPrice,
+                    formatCurrency,
+                    formatSignedCurrency,
+                    formatSignedPercent,
+                    colorClass,
+                    formatTime,
+                    normalizeStatus,
+                    loadDashboard,
+                    openStrategy,
+                    closeStrategy,
+                    liquidateAll,
+                    restartBot,
+                    startAuth
                 };
             }
         }).mount('#app');

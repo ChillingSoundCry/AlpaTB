@@ -673,3 +673,10 @@
 {"level":"info","ts":"2026-06-12T14:58:50.094Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
 {"level":"info","ts":"2026-06-12T15:09:09.994Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
 {"level":"info","ts":"2026-06-12T15:09:15.211Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:11:23.366Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:20:52.618Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:30:17.525Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T15:30:23.452Z","caller":"logger/log.go:27","msg":"entery AuthChallenge"}
+{"level":"info","ts":"2026-06-12T15:30:30.087Z","caller":"logger/log.go:27","msg":"entery AuthChallenge"}
+{"level":"info","ts":"2026-06-12T15:30:30.131Z","caller":"logger/log.go:27","msg":"entery AuthVerify"}
+{"level":"info","ts":"2026-06-12T15:30:30.173Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}

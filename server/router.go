@@ -19,6 +19,8 @@ func StartRouter() {
 	http.HandleFunc("/api/bars", GetBarsHandler)
 	http.HandleFunc("/api/liquidate", LiquidateHandler)
 	http.HandleFunc("/api/restart", RestartHandler)
+	http.HandleFunc("/api/auth/challenge", AuthChallenge)
+	http.HandleFunc("/api/auth/verify", AuthVerify)
 
 	fmt.Println("服务已启动，监听端口 :8400...")
 	if err := http.ListenAndServe("127.0.0.1:8400", nil); err != nil {
