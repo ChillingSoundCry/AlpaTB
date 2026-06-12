@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lazrus | 策略中心</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#F5F3FF', 100: '#EDE9FE', 200: '#DDD6FE', 300: '#C4B5FD',
+                            400: '#A78BFA', 500: '#8B5CF6', 600: '#7C3AED', 700: '#6D28D9',
+                            800: '#5B21B6', 900: '#4C1D95'
+                        }
+                    },
+                    boxShadow: {
+                        soft: '0 4px 24px -6px rgba(15, 23, 42, 0.08)',
+                        'soft-lg': '0 12px 40px -12px rgba(15, 23, 42, 0.10)',
+                    },
+                },
+            },
+        };
+    </script>
+    <style>
+        html, body { margin: 0; padding: 0; min-height: 100vh; background: #f1f5f9; background-attachment: fixed; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif; }
+        body::before { content: ''; position: fixed; inset: 0; z-index: 0; pointer-events: none; background: radial-gradient(ellipse 80% 60% at 20% 15%, rgba(139,92,246,0.06) 0%, transparent 55%), radial-gradient(ellipse 60% 50% at 75% 80%, rgba(6,182,212,0.05) 0%, transparent 55%); background-attachment: fixed; }
+        #app { position: relative; z-index: 1; }
+        .glass { background: rgba(255,255,255,0.78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.55); box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.03); }
+        .card-hover { transition: all 0.22s; cursor: pointer; }
+        .card-hover:hover { transform: translateY(-3px); box-shadow: 0 14px 36px -12px rgba(124,58,237,0.18); }
+        .fade-in { animation: fadeSlideIn 0.28s; }
+        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(16px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        .scrollbar-thin::-webkit-scrollbar { width: 5px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
+    </style>
+</head>
+<body class="text-slate-800 antialiased">
+    <div id="app" class="min-h-screen flex flex-col">
+        <header class="sticky top-0 z-40 bg-white/82 backdrop-blur-lg border-b border-slate-200/50 shadow-sm">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="h-16 flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-cyan-500 flex items-center justify-center text-white font-bold">LZ</div>
+                        <div>
+                            <div class="text-slate-900 font-bold">Lazrus</div>
+                            <div class="text-slate-500 text-[10px] uppercase">Quant Strategy Center</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <!-- 状态指示（使用 account.status） -->
+                        <div class="hidden sm:flex items-center gap-2 text-sm"
+                             :class="dashboard.account.status === 'running' ? 'text-emerald-600' : 'text-slate-400'">
+                            <span class="relative flex h-2.5 w-2.5">
+                                <span v-if="dashboard.account.status === 'running'"
+                                      class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-70"
+                                      :class="dashboard.account.status === 'running' ? 'bg-emerald-400' : 'bg-slate-300'"></span>
+                                <span class="relative inline-flex rounded-full h-2.5 w-2.5"
+                                      :class="dashboard.account.status === 'running' ? 'bg-emerald-500' : 'bg-slate-400'"></span>
+                            </span>
+                            {{ dashboard.account.status === 'running' ? '运行中' : '已停止' }}
+                        </div>
+                        <button @click="liquidateAll" class="px-3 py-2 rounded-lg bg-rose-600 text-white text-sm font-medium hover:bg-rose-700 transition shadow-sm active:scale-95" :disabled="liquidating">
+                            {{ liquidating ? '平仓中...' : '一键平仓' }}
+                        </button>
+                        <button @click="restartBot" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95" :disabled="restarting">
+                            {{ restarting ? '重启中...' : '重启机器人' }}
+                        </button>
+                        <button @click="loadDashboard" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95">刷新数据</button>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main class="flex-1 pb-14">
+            <!-- 账户表现与资产构成 -->
+            <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6">
+                <div class="grid lg:grid-cols-[1.5fr_1fr] gap-5">
+                    <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
+                        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-50 text-brand-700 text-xs font-bold">账户表现</div>
+                        <h1 class="mt-3 text-3xl font-extrabold text-slate-900">{{ formatCurrency(dashboard.account.equity) }}</h1>
+                        <p class="text-sm text-slate-500">初始资金：{{ formatCurrency(dashboard.performance.initial_equity) }}</p>
+                        <div class="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div class="bg-white/60 rounded-xl p-4 border">
+                                <div class="text-xs text-slate-500">总盈亏</div>
+                                <div class="text-lg font-bold" :class="colorClass(dashboard.performance.total_pnl)">{{ formatSignedCurrency(dashboard.performance.total_pnl) }}</div>
+                            </div>
+                            <div class="bg-white/60 rounded-xl p-4 border">
+                                <div class="text-xs text-slate-500">未实现盈亏</div>
+                                <div class="text-lg font-bold" :class="colorClass(dashboard.performance.unrealized_pnl)">{{ formatSignedCurrency(dashboard.performance.unrealized_pnl) }}</div>
+                            </div>
+                            <div class="bg-white/60 rounded-xl p-4 border">
+                                <div class="text-xs text-slate-500">收益率</div>
+                                <div class="text-lg font-bold" :class="colorClass(dashboard.performance.return_pct)">{{ formatSignedPercent(dashboard.performance.return_pct) }}</div>
+                            </div>
+                            <div class="bg-white/60 rounded-xl p-4 border">
+                                <div class="text-xs text-slate-500">运行策略</div>
+                                <div class="text-lg font-bold text-slate-800">{{ dashboard.strategies.length }}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
+                        <h2 class="text-lg font-bold text-slate-900">资产构成</h2>
+                        <div class="mt-5 space-y-4">
+                            <div class="flex justify-between border-b pb-3">
+                                <span class="text-sm text-slate-500">可用现金</span>
+                                <span class="font-semibold" :class="dashboard.account.cash < 0 ? 'text-rose-600' : 'text-slate-900'">{{ formatCurrency(dashboard.account.cash) }}</span>
+                            </div>
+                            <div class="flex justify-between border-b pb-3">
+                                <span class="text-sm text-slate-500">购买力</span>
+                                <span class="font-semibold text-slate-900">{{ formatCurrency(dashboard.account.buying_power) }}</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-sm text-slate-500">数据更新</span>
+                                <span class="text-xs font-mono bg-slate-100 px-2 py-1 rounded">{{ dashboard.updatedAt }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 权益曲线 -->
+            <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
+                <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
+                    <div class="flex justify-between mb-3">
+                        <h2 class="text-lg font-bold">权益曲线</h2>
+                        <span class="text-xs text-slate-400">快照 · {{ dashboard.snapshots.length }} 点</span>
+                    </div>
+                    <div id="equity-chart" class="w-full" style="height: 320px;"></div>
+                    <div v-if="dashboard.snapshots.length === 0" class="text-center py-10 text-slate-400">暂无快照数据</div>
+                </div>
+            </section>
+
+            <!-- 策略面板 -->
+            <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
+                <div class="flex justify-between mb-4">
+                    <h2 class="text-xl font-bold">运行策略面板</h2>
+                    <span class="text-sm text-slate-500">共 {{ dashboard.strategies.length }} 个</span>
+                </div>
+                <div class="grid md:grid-cols-2 xl:grid-cols-3 gap-5">
+                    <button v-for="s in dashboard.strategies" :key="s.id" @click="openStrategy(s)" class="text-left glass rounded-2xl p-5 card-hover w-full">
+                        <div class="flex justify-between">
+                            <div>
+                                <h3 class="text-lg font-bold capitalize">{{ s.name }}</h3>
+                                <span class="text-xs text-brand-600 bg-brand-50 px-2 py-0.5 rounded-full">{{ s.symbol }}</span>
+                            </div>
+                            <span class="px-2.5 py-1 rounded text-[10px] font-bold uppercase"
+                                  :class="s.positions.length ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'">
+                                {{ s.positions.length ? '持仓中' : '空仓' }}
+                            </span>
+                        </div>
+                        <div class="mt-5 grid grid-cols-2 gap-4">
+                            <div>
+                                <div class="text-[11px] text-slate-500">策略总盈亏</div>
+                                <div class="text-base font-bold" :class="colorClass(s.total_pnl)">{{ formatSignedCurrency(s.total_pnl) }}</div>
+                            </div>
+                            <div>
+                                <div class="text-[11px] text-slate-500">最新价</div>
+                                <div class="text-base font-bold text-slate-900">{{ formatCurrency(dashboard.latest_prices[s.symbol] || s.last_price) }}</div>
+                            </div>
+                        </div>
+                        <div class="mt-5 pt-4 border-t flex justify-between text-xs text-slate-500">
+                            <span>成交: <b>{{ s.trade_count }}</b></span>
+                            <span>订单: <b>{{ s.order_count }}</b></span>
+                            <span class="text-brand-600">详情 →</span>
+                        </div>
+                    </button>
+                </div>
+            </section>
+
+            <!-- 持仓 & 成交表格 -->
+            <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6 grid lg:grid-cols-2 gap-5">
+                <div class="glass rounded-2xl p-5 shadow-soft">
+                    <h2 class="text-lg font-bold mb-4">当前持仓</h2>
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-slate-400 border-b">
+                                <th class="pb-2">标的</th>
+                                <th class="pb-2">数量</th>
+                                <th class="pb-2">均价/现价</th>
+                                <th class="pb-2 text-right">浮动盈亏</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="dashboard.positions.length === 0">
+                                <td colspan="4" class="py-8 text-center text-slate-400 italic">暂无持仓</td>
+                            </tr>
+                            <tr v-for="p in dashboard.positions" :key="p.symbol" class="hover:bg-slate-50">
+                                <td class="py-2 font-bold">{{ p.symbol }}</td>
+                                <td class="py-2">
+                                    <span :class="p.side==='long'?'text-emerald-600':'text-rose-600'">{{ p.side==='long'?'多':'空' }}</span>
+                                    {{ p.qty }}
+                                </td>
+                                <td class="py-2 text-slate-600">{{ formatPrice(p.avg_entry_price) }} / {{ formatPrice(p.current_price) }}</td>
+                                <td class="py-2 text-right font-bold" :class="colorClass(p.unrealized_pnl)">{{ formatSignedCurrency(p.unrealized_pnl) }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="glass rounded-2xl p-5 shadow-soft flex flex-col">
+                    <div class="flex justify-between mb-4">
+                        <h2 class="text-lg font-bold">最近成交</h2>
+                        <span class="text-xs bg-slate-100 px-2 py-1 rounded-full">共 {{ allTrades.length }} 条</span>
+                    </div>
+                    <div class="overflow-y-auto flex-1" style="max-height:360px;">
+                        <table class="w-full text-sm">
+                            <thead class="sticky top-0 bg-white/90">
+                                <tr class="text-slate-400 border-b">
+                                    <th class="pb-2 text-xs">时间</th>
+                                    <th class="pb-2 text-xs">策略/标的</th>
+                                    <th class="pb-2 text-xs text-right">方向/价格</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-if="allTrades.length === 0">
+                                    <td colspan="3" class="py-8 text-center text-slate-400 italic">暂无成交</td>
+                                </tr>
+                                <tr v-for="t in allTrades.slice(0,60)" :key="t.id" class="hover:bg-slate-50">
+                                    <td class="py-2 text-xs text-slate-500">{{ formatTime(t.time) }}</td>
+                                    <td class="py-2">
+                                        <div class="font-semibold text-xs">{{ t.strategy }}</div>
+                                        <div class="text-[11px] text-slate-400">{{ t.symbol }}</div>
+                                    </td>
+                                    <td class="py-2 text-right">
+                                        <div :class="t.side==='buy'?'text-emerald-600':'text-rose-600'" class="font-bold text-xs">
+                                            {{ t.side==='buy'?'买入':'卖出' }} {{ t.qty }}
+                                        </div>
+                                        <div class="text-xs">{{ formatPrice(t.price) }}</div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- 策略详情弹窗 -->
+        <teleport to="body">
+            <div v-if="selectedStrategy" class="fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="closeStrategy">
+                <div class="absolute inset-0 bg-slate-900/50 backdrop-blur-sm"></div>
+                <div class="relative w-full max-w-6xl bg-white rounded-3xl shadow-2xl fade-in max-h-[95vh] flex flex-col">
+                    <div class="px-6 py-4 border-b flex justify-between bg-slate-50/60">
+                        <div>
+                            <h3 class="text-2xl font-black capitalize">{{ selectedStrategy.name }} · {{ selectedStrategy.symbol }}</h3>
+                            <span class="text-xs text-slate-500">共 {{ selectedStrategy.trade_count }} 笔成交 · {{ selectedStrategy.order_count }} 笔订单</span>
+                        </div>
+                        <button @click="closeStrategy" class="w-10 h-10 rounded-full border flex items-center justify-center hover:bg-slate-100 text-slate-500 transition active:scale-95">✕</button>
+                    </div>
+                    <div class="flex-1 overflow-y-auto p-6 grid lg:grid-cols-[1fr_340px] gap-6">
+                        <div class="flex flex-col gap-6">
+                            <div class="grid grid-cols-3 gap-4">
+                                <div class="bg-slate-50 rounded-xl p-4">
+                                    <div class="text-xs">已实现盈亏</div>
+                                    <div class="text-xl font-bold" :class="colorClass(selectedStrategy.realized_pnl)">{{ formatSignedCurrency(selectedStrategy.realized_pnl) }}</div>
+                                </div>
+                                <div class="bg-slate-50 rounded-xl p-4">
+                                    <div class="text-xs">未实现盈亏</div>
+                                    <div class="text-xl font-bold" :class="colorClass(selectedStrategy.unrealized_pnl)">{{ formatSignedCurrency(selectedStrategy.unrealized_pnl) }}</div>
+                                </div>
+                                <div class="bg-slate-50 rounded-xl p-4">
+                                    <div class="text-xs">收益率</div>
+                                    <div class="text-xl font-bold" :class="colorClass(selectedStrategy.return_pct)">{{ formatSignedPercent(selectedStrategy.return_pct) }}</div>
+                                </div>
+                            </div>
+                            <div class="bg-white border rounded-xl p-4 flex-1 min-h-[350px] flex flex-col">
+                                <div class="flex justify-between items-center mb-2">
+                                    <h4 class="text-sm font-bold">成交点位曲线（小时K线）</h4>
+                                    <span v-if="strategyChartLoading" class="text-xs text-amber-500 animate-pulse">加载K线数据中...</span>
+                                    <span v-else-if="strategyBarsCount > 0" class="text-xs text-slate-400">{{ strategyBarsCount }} 根K线</span>
+                                </div>
+                                <div id="strategy-chart" class="flex-1 w-full"></div>
+                            </div>
+                            <div v-if="selectedStrategy.config" class="bg-brand-50 rounded-xl p-4">
+                                <h4 class="text-sm font-bold text-brand-900 mb-2">运行时配置</h4>
+                                <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                                    <div v-for="(val, key) in selectedStrategy.config" :key="key">
+                                        <div class="text-xs text-brand-600 capitalize">{{ key.replace(/_/g,' ') }}</div>
+                                        <div class="font-semibold text-sm">{{ val }}</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex flex-col gap-6">
+                            <div class="border rounded-xl p-4">
+                                <h4 class="text-sm font-bold mb-2">策略关联持仓</h4>
+                                <div v-if="!selectedStrategy.positions.length" class="text-sm text-slate-500 text-center py-4">无持仓</div>
+                                <div v-else class="space-y-3">
+                                    <div v-for="p in selectedStrategy.positions" :key="p.symbol" class="flex justify-between text-sm border-b pb-2">
+                                        <div>
+                                            <div class="font-bold">{{ p.symbol }} <span class="text-xs" :class="p.side==='long'?'text-emerald-600':'text-rose-600'">{{ p.side }}</span></div>
+                                            <div class="text-xs text-slate-500">成本: {{ formatPrice(p.avg_entry_price) }}</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div>{{ p.qty }} 股</div>
+                                            <div class="text-xs font-bold" :class="colorClass(p.unrealized_pnl)">{{ formatSignedCurrency(p.unrealized_pnl) }}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- 当前挂单 -->
+                            <div class="border rounded-xl p-4">
+                                <h4 class="text-sm font-bold mb-2">当前挂单</h4>
+                                <div v-if="!selectedStrategy.orders.filter(o => o.status === 'open').length" class="text-sm text-slate-500 text-center py-4">无挂单</div>
+                                <div v-else class="space-y-3">
+                                    <div v-for="o in selectedStrategy.orders.filter(o => o.status === 'open')" :key="o.id" class="flex justify-between text-sm border-b pb-2">
+                                        <div>
+                                            <div class="font-bold">{{ o.symbol }} <span class="text-xs" :class="o.side==='buy'?'text-emerald-600':'text-rose-600'">{{ o.side }}</span> <span class="ml-2 text-xs text-slate-500">{{ o.type }}</span></div>
+                                            <div class="text-xs text-slate-500">限价: {{ formatPrice(o.limit_price) }}</div>
+                                            <div class="text-xs text-slate-400">{{ o.created_at ? formatTime(o.created_at) : '--' }}</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div>{{ o.qty }} 股</div>
+                                            <div class="text-xs" v-if="o.filled_qty > 0">已成交: {{ o.filled_qty }}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="border rounded-xl p-4 flex-1 flex flex-col min-h-0">
+                                <h4 class="text-sm font-bold mb-2">成交明细</h4>
+                                <div class="overflow-y-auto flex-1 space-y-2">
+                                    <div v-if="!selectedStrategy.trades.length" class="text-sm text-slate-500 text-center py-4">无成交</div>
+                                    <div v-for="t in selectedStrategy.trades" :key="t.id" class="bg-slate-50 rounded-lg p-2.5 text-sm flex justify-between">
+                                        <div>
+                                            <span class="font-bold text-[10px] px-1.5 py-0.5 rounded" :class="t.side==='buy'?'bg-emerald-100 text-emerald-700':'bg-rose-100 text-rose-700'">{{ t.side==='buy'?'买':'卖' }}</span>
+                                            {{ t.symbol }}
+                                            <div class="text-[10px] text-slate-400 mt-1">{{ formatTime(t.time) }}</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="font-bold">{{ formatPrice(t.price) }}</div>
+                                            <div class="text-xs">{{ t.qty }} 股</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </teleport>
+
+        <footer class="max-w-7xl mx-auto px-4 py-6 mt-auto border-t text-xs text-slate-400 flex justify-between">
+            <span>Lazrus Quant Strategy Center · 更新: {{ dashboard.updatedAt }}</span>
+            <span>快照 {{ dashboard.snapshots.length }} · 策略 {{ dashboard.strategies.length }}</span>
+        </footer>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, nextTick } = Vue;
+        const API_BASE = '';
+
+        createApp({
+            setup() {
+                const loading = ref(false);
+                const liquidating = ref(false);
+                const restarting = ref(false);
+                const strategyChartLoading = ref(false);
+                const strategyBarsCount = ref(0);
+                const dashboard = ref({
+                    account: { status: 'stopped' },
+                    performance: {},
+                    positions: [],
+                    strategies: [],
+                    latest_prices: {},
+                    meta: {},
+                    snapshots: [],
+                    errors: [],
+                    updatedAt: ''
+                });
+                const allTrades = ref([]);
+                const selectedStrategy = ref(null);
+                let equityChart = null;
+                let strategyChart = null;
+
+                const formatPrice = (v) => {
+                    const n = Number(v || 0);
+                    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                };
+
+                const formatNumber = (v) => {
+                    const n = Number(v || 0);
+                    const str = n.toString();
+                    const dotIdx = str.indexOf('.');
+                    if (dotIdx >= 0 && str.length - dotIdx - 1 > 2) {
+                        return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+                    }
+                    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                };
+
+                const formatCurrency = (v) => '$' + Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                const formatSignedCurrency = (v) => (Number(v || 0) >= 0 ? '+' : '') + formatCurrency(v);
+                const formatSignedPercent = (v) => {
+                    const n = Number(v || 0) * 100;
+                    return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+                };
+                const colorClass = (v) => Number(v || 0) >= 0 ? 'text-emerald-600' : 'text-rose-600';
+
+                const formatTime = (iso) => {
+                    if (!iso) return '--';
+                    const d = new Date(iso);
+                    if (isNaN(d.getTime())) return '--';
+                    return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+                };
+
+                const formatTimestamp = (ts) => {
+                    const d = new Date(ts * 1000);
+                    if (isNaN(d.getTime())) return '--';
+                    return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+                };
+
+                const loadDashboard = async () => {
+                    loading.value = true;
+                    try {
+                        const res = await fetch(`${API_BASE}/api/dashboard`);
+                        const data = await res.json();
+                        dashboard.value.account = data.account || { status: 'stopped' };
+                        dashboard.value.performance = data.performance || {};
+                        dashboard.value.positions = data.positions || [];
+                        dashboard.value.latest_prices = data.latest_prices || {};
+                        dashboard.value.meta = data.meta || {};
+                        dashboard.value.snapshots = data.snapshots || [];
+                        dashboard.value.errors = data.errors || [];
+                        dashboard.value.updatedAt = data.updated_at || '';
+                        dashboard.value.strategies = data.strategies || [];
+                        const trades = [];
+                        if (data.trades_by_strategy) {
+                            Object.values(data.trades_by_strategy).forEach(g => trades.push(...g.trades));
+                        }
+                        allTrades.value = trades.sort((a, b) => new Date(b.time) - new Date(a.time));
+                    } catch (e) { console.error(e); } finally { loading.value = false; }
+                };
+
+                const renderEquityChart = () => {
+                    const dom = document.getElementById('equity-chart');
+                    if (!dom || dashboard.value.snapshots.length === 0) return;
+                    if (equityChart) equityChart.dispose();
+                    equityChart = echarts.init(dom);
+                    const xData = dashboard.value.snapshots.map(s => formatTime(s.time));
+                    const yData = dashboard.value.snapshots.map(s => s.equity);
+                    equityChart.setOption({
+                        tooltip: { trigger: 'axis', valueFormatter: (value) => '$' + Number(value || 0).toFixed(2) },
+                        grid: { left: '8%', right: '5%', top: '10%', bottom: '10%' },
+                        xAxis: { data: xData, axisLabel: { fontSize: 10, rotate: xData.length > 15 ? 30 : 0 } },
+                        yAxis: { scale: true, axisLabel: { fontSize: 10, formatter: (v) => '$' + Number(v || 0).toFixed(2) } },
+                        series: [{
+                            data: yData, type: 'line', smooth: 0.3,
+                            areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(139,92,246,0.25)' }, { offset: 1, color: 'rgba(139,92,246,0.02)' }]) },
+                            lineStyle: { color: '#7C3AED', width: 2 }, itemStyle: { color: '#7C3AED' },
+                            symbol: 'circle', symbolSize: 4
+                        }]
+                    });
+                };
+
+                const openStrategy = (strategy) => {
+                    selectedStrategy.value = strategy;
+                    strategyBarsCount.value = 0;
+                    nextTick(() => renderStrategyChart(strategy));
+                };
+
+                const closeStrategy = () => {
+                    selectedStrategy.value = null;
+                    strategyBarsCount.value = 0;
+                    if (strategyChart) { strategyChart.dispose(); strategyChart = null; }
+                };
+
+                const fetchBars = async (symbol) => {
+                    try {
+                        const res = await fetch(`${API_BASE}/api/bars?symbol=${symbol}`);
+                        if (!res.ok) return null;
+                        const data = await res.json();
+                        if (Array.isArray(data) && data.length > 0) {
+                            return data.sort((a, b) => (a.t || 0) - (b.t || 0));
+                        }
+                        return data;
+                    } catch { return null; }
+                };
+
+                const renderStrategyChart = async (strategy) => {
+                    const dom = document.getElementById('strategy-chart');
+                    if (!dom) return;
+                    if (strategyChart) { strategyChart.dispose(); strategyChart = null; }
+                    strategyChart = echarts.init(dom);
+                    const trades = strategy.trades || [];
+
+                    if (trades.length === 0 && !strategy.symbol) {
+                        strategyChart.setOption({ title: { text: '无成交记录', left: 'center', top: 'center', textStyle: { color: '#94a3b8', fontSize: 14 } } });
+                        strategyBarsCount.value = 0;
+                        return;
+                    }
+
+                    const mainSymbol = strategy.symbol;
+                    strategyChartLoading.value = true;
+                    const bars = await fetchBars(mainSymbol);
+                    strategyChartLoading.value = false;
+
+                    let xData, yData, markPoints = [];
+                    let chartTitle = '';
+
+                    if (bars && bars.length > 0) {
+                        strategyBarsCount.value = bars.length;
+                        xData = bars.map(b => formatTimestamp(b.t));
+                        yData = bars.map(b => Number((b.c || 0).toFixed(2)));
+                        const buyMarks = [], sellMarks = [];
+                        trades.forEach(t => {
+                            const tTime = new Date(t.time).getTime();
+                            let idx = 0, minDiff = Infinity;
+                            bars.forEach((b, i) => {
+                                const barTime = (b.t || 0) * 1000;
+                                const diff = Math.abs(barTime - tTime);
+                                if (diff < minDiff) { minDiff = diff; idx = i; }
+                            });
+                            if (minDiff <= 4 * 3600 * 1000) {
+                                const tradePrice = Number(Number(t.price || 0).toFixed(2));
+                                const point = {
+                                    coord: [idx, tradePrice], value: tradePrice,
+                                    symbol: 'pin', symbolSize: 40, symbolOffset: [0, -8],
+                                    label: { show: true, fontSize: 10, fontWeight: 'bold', formatter: t.side === 'buy' ? 'B' : 'S', color: '#fff', position: 'inside' },
+                                    tooltip: { formatter: () => `${t.side==='buy'?'买入':'卖出'}<br/>时间: ${formatTimestamp(bars[idx].t)}<br/>价格: $${tradePrice.toFixed(2)}<br/>数量: ${t.qty||'--'} 股` }
+                                };
+                                if (t.side === 'buy') {
+                                    point.itemStyle = { color: '#059669', borderColor: '#fff', borderWidth: 1.5 };
+                                    point.label.backgroundColor = '#059669'; point.label.borderRadius = 3; point.label.padding = [2,5];
+                                    buyMarks.push(point);
+                                } else {
+                                    point.itemStyle = { color: '#dc2626', borderColor: '#fff', borderWidth: 1.5 };
+                                    point.label.backgroundColor = '#dc2626'; point.label.borderRadius = 3; point.label.padding = [2,5];
+                                    sellMarks.push(point);
+                                }
+                            }
+                        });
+                        markPoints = [...buyMarks, ...sellMarks];
+                        chartTitle = mainSymbol + ' 小时K线';
+                    } else {
+                        strategyBarsCount.value = 0;
+                        const sortedTrades = [...trades].sort((a,b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+                        xData = sortedTrades.map(t => formatTime(t.time));
+                        yData = sortedTrades.map(t => Number(Number(t.price || 0).toFixed(2)));
+                        markPoints = sortedTrades.map((t,i) => ({
+                            coord: [i, Number(Number(t.price || 0).toFixed(2))],
+                            value: Number(Number(t.price || 0).toFixed(2)),
+                            symbol: 'pin', symbolSize: 40, symbolOffset: [0,-8],
+                            label: { show: true, fontSize: 10, fontWeight: 'bold', formatter: t.side==='buy'?'B':'S', color: '#fff', position: 'inside' },
+                            tooltip: { formatter: () => `${t.side==='buy'?'买入':'卖出'}<br/>时间: ${formatTime(t.time)}<br/>价格: $${Number(t.price||0).toFixed(2)}<br/>数量: ${t.qty||'--'} 股` },
+                            itemStyle: { color: t.side==='buy'?'#059669':'#dc2626', borderColor: '#fff', borderWidth: 1.5 },
+                            label: { show: true, fontSize: 10, fontWeight: 'bold', formatter: t.side==='buy'?'B':'S', color: '#fff', position: 'inside', backgroundColor: t.side==='buy'?'#059669':'#dc2626', borderRadius: 3, padding: [2,5] }
+                        }));
+                        chartTitle = mainSymbol + ' 成交点位';
+                    }
+
+                    const option = {
+                        title: chartTitle ? { text: chartTitle, left: 'center', top: 0, textStyle: { fontSize: 12, color: '#64748b', fontWeight: 'normal' } } : undefined,
+                        tooltip: { trigger: 'axis', formatter: (params) => {
+                            if (!params || params.length === 0) return '';
+                            const p = params[0];
+                            let html = `<b>${p.axisValue}</b><br/>`;
+                            if (p.seriesType === 'line') {
+                                html += `收盘价: <b>$${Number(p.value).toFixed(2)}</b>`;
+                                if (bars && bars.length > 0 && p.dataIndex < bars.length) {
+                                    const bar = bars[p.dataIndex];
+                                    html += `<br/>开盘: $${Number(bar.o || 0).toFixed(2)}`;
+                                    html += `<br/>最高: $${Number(bar.h || 0).toFixed(2)}`;
+                                    html += `<br/>最低: $${Number(bar.l || 0).toFixed(2)}`;
+                                    html += `<br/>成交量: ${bar.v || 0}`;
+                                }
+                            }
+                            return html;
+                        }},
+                        grid: { left: '8%', right: '8%', top: chartTitle ? '14%' : '10%', bottom: '12%' },
+                        xAxis: { data: xData, axisLabel: { fontSize: 10, rotate: xData.length > 12 ? 35 : 0, interval: xData.length > 20 ? Math.floor(xData.length / 12) : 0 } },
+                        yAxis: { scale: true, axisLabel: { fontSize: 10, formatter: (v) => '$' + Number(v || 0).toFixed(2) }, splitLine: { lineStyle: { color: '#f1f5f9', type: 'dashed' } } },
+                        series: [{
+                            data: yData, type: 'line', smooth: 0.3,
+                            symbol: 'circle', symbolSize: 4,
+                            lineStyle: { color: '#6366f1', width: 2 }, itemStyle: { color: '#6366f1' },
+                            areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1, [{ offset: 0, color: 'rgba(99,102,241,0.18)' }, { offset: 1, color: 'rgba(99,102,241,0.02)' }]) },
+                            markPoint: { data: markPoints, animation: true, animationDuration: 300 }
+                        }]
+                    };
+                    strategyChart.setOption(option);
+                    if (markPoints.length > 0 && yData.length > 0) {
+                        const allPrices = [...yData, ...markPoints.map(m => m.value)].filter(v => !isNaN(v));
+                        const minPrice = Math.min(...allPrices);
+                        const maxPrice = Math.max(...allPrices);
+                        const padding = (maxPrice - minPrice) * 0.08 || 1;
+                        strategyChart.setOption({ yAxis: { min: Math.floor((minPrice - padding) * 100) / 100, max: Math.ceil((maxPrice + padding) * 100) / 100 } });
+                    }
+                };
+
+                const handleAllResize = () => {
+                    try { if (equityChart) equityChart.resize(); } catch (e) { /* ignore */ }
+                    try { if (strategyChart) strategyChart.resize(); } catch (e) { /* ignore */ }
+                };
+                window.addEventListener('resize', handleAllResize);
+
+                const liquidateAll = async () => {
+                    if (!confirm('确认平仓所有持仓并取消全部挂单？')) return;
+                    liquidating.value = true;
+                    try {
+                        const res = await fetch(`${API_BASE}/api/liquidate`, { method: 'POST' });
+                        if (!res.ok) throw new Error(await res.text());
+                        await loadDashboard();
+                    } catch (e) { alert('平仓失败: ' + e.message); } finally { liquidating.value = false; }
+                };
+
+                const restartBot = async () => {
+                    if (!confirm('确认重启机器人？')) return;
+                    restarting.value = true;
+                    try {
+                        const res = await fetch(`${API_BASE}/api/restart`, { method: 'POST' });
+                        if (!res.ok) throw new Error(await res.text());
+                        await loadDashboard();
+                    } catch (e) { alert('重启失败: ' + e.message); } finally { restarting.value = false; }
+                };
+
+                onMounted(() => {
+                    loadDashboard().then(() => nextTick(renderEquityChart));
+                });
+
+                return {
+                    loading, liquidating, restarting, strategyChartLoading, strategyBarsCount,
+                    dashboard, allTrades, selectedStrategy,
+                    formatNumber, formatPrice, formatCurrency, formatSignedCurrency, formatSignedPercent,
+                    colorClass, formatTime,
+                    loadDashboard, openStrategy, closeStrategy, liquidateAll, restartBot
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
