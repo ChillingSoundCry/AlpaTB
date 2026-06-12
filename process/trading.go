@@ -106,6 +106,7 @@ func (c *AlpacaClient) doJSON(ctx context.Context, method, url string, body any,
 		}
 		reqBody = bytes.NewReader(b)
 	}
+
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return err
@@ -119,6 +120,7 @@ func (c *AlpacaClient) doJSON(ctx context.Context, method, url string, body any,
 		return err
 	}
 	defer resp.Body.Close()
+
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -130,6 +132,39 @@ func (c *AlpacaClient) doJSON(ctx context.Context, method, url string, body any,
 		return nil
 	}
 	return json.Unmarshal(b, out)
+}
+
+type PortfolioHistory struct {
+	Timestamp []int64   `json:"timestamp"`
+	Equity    []float64 `json:"equity"`
+}
+
+func (c *AlpacaClient) GetPortfolioHistory7D(ctx context.Context) (float64, error) {
+	u, _ := url.Parse(c.baseURL + "/v2/account/portfolio/history")
+	q := u.Query()
+	q.Set("period", "7D")
+	q.Set("timeframe", "1D")
+	u.RawQuery = q.Encode()
+
+	var out PortfolioHistory
+	if err := c.doJSON(ctx, http.MethodGet, u.String(), nil, &out); err != nil {
+		return 0, err
+	}
+	if len(out.Equity) == 0 {
+		return 0, errors.New("no portfolio history data")
+	}
+
+	if len(out.Timestamp) == len(out.Equity) && len(out.Timestamp) > 0 {
+		oldestIdx := 0
+		for i := 1; i < len(out.Timestamp); i++ {
+			if out.Timestamp[i] < out.Timestamp[oldestIdx] {
+				oldestIdx = i
+			}
+		}
+		return out.Equity[oldestIdx], nil
+	}
+
+	return out.Equity[0], nil
 }
 
 type Account struct {
@@ -233,12 +268,12 @@ func (c *AlpacaClient) GetPositions(ctx context.Context) ([]Position, error) {
 }
 
 func (c *AlpacaClient) ListOrders(ctx context.Context, status string) ([]Order, error) {
-	url := c.baseURL + "/v2/orders?nested=true&limit=500"
+	u := c.baseURL + "/v2/orders?nested=true&limit=500"
 	if status != "" {
-		url += "&status=" + status
+		u += "&status=" + status
 	}
 	var out []Order
-	if err := c.doJSON(ctx, http.MethodGet, url, nil, &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, u, nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -272,7 +307,6 @@ func (c *AlpacaClient) PlaceOrder(ctx context.Context, req OrderRequest) (*Order
 	return &out, nil
 }
 
-// CloseAllPositions 调用 Alpaca 原生的一键平仓端点（自动撤单 + 市价清仓所有标的）
 func (c *AlpacaClient) CloseAllPositions(ctx context.Context) error {
 	return c.doJSON(ctx, http.MethodDelete, c.baseURL+"/v2/positions?cancel_orders=true", nil, nil)
 }
@@ -470,10 +504,11 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, buyingPo
 		notional := g.cfg.SeedQty * center
 		if buyingPower >= notional {
 			_, err := g.client.PlaceOrder(ctx, OrderRequest{
-				Symbol: g.cfg.Symbol,
-				Qty:    fmt.Sprintf("%.6f", g.cfg.SeedQty),
-				Side:   "buy",
-				Type:   "limit", TimeInForce: "day",
+				Symbol:        g.cfg.Symbol,
+				Qty:           fmt.Sprintf("%.6f", g.cfg.SeedQty),
+				Side:          "buy",
+				Type:          "limit",
+				TimeInForce:   "day",
 				LimitPrice:    fmt.Sprintf("%.2f", center),
 				ClientOrderID: fmt.Sprintf("grid-seed-%s-%d", g.cfg.Symbol, time.Now().UnixNano()),
 			})
@@ -560,10 +595,12 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 	}
 
 	_, err := g.client.PlaceOrder(ctx, OrderRequest{
-		Symbol: g.cfg.Symbol,
-		Qty:    fmt.Sprintf("%.6f", qty),
-		Side:   "buy",
-		Type:   "limit", TimeInForce: "day", LimitPrice: fmt.Sprintf("%.2f", price),
+		Symbol:        g.cfg.Symbol,
+		Qty:           fmt.Sprintf("%.6f", qty),
+		Side:          "buy",
+		Type:          "limit",
+		TimeInForce:   "day",
+		LimitPrice:    fmt.Sprintf("%.2f", price),
 		ClientOrderID: fmt.Sprintf("grid-buy-%s-%d-%d", g.cfg.Symbol, level, time.Now().UnixNano()),
 	})
 	if err == nil {
@@ -580,10 +617,12 @@ func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qt
 	}
 
 	_, err := g.client.PlaceOrder(ctx, OrderRequest{
-		Symbol: g.cfg.Symbol,
-		Qty:    fmt.Sprintf("%.6f", qty),
-		Side:   "sell",
-		Type:   "limit", TimeInForce: "day", LimitPrice: fmt.Sprintf("%.2f", price),
+		Symbol:        g.cfg.Symbol,
+		Qty:           fmt.Sprintf("%.6f", qty),
+		Side:          "sell",
+		Type:          "limit",
+		TimeInForce:   "day",
+		LimitPrice:    fmt.Sprintf("%.2f", price),
 		ClientOrderID: fmt.Sprintf("grid-sell-%s-%d-%d", g.cfg.Symbol, level, time.Now().UnixNano()),
 	})
 	if err == nil {
@@ -617,23 +656,13 @@ func (g *GridStrategy) levelIndex(center, price float64) int {
 // -----------------------
 // Open/Close Strategy
 // -----------------------
-//
-// 这个策略保留原函数名，行为已经改成：
-// 1) 盘前卖出：在开盘前几分钟卖掉持仓
-// 2) 盘尾买入：在收盘前几分钟买入，持有到次日开盘前
-//
-// 这样就实现了你要的“盘前卖、盘尾买”。
-// 为了兼容你旧代码，旧字段仍保留，但优先使用新字段：
-// SellMinutesBeforeOpen / BuyMinutesBeforeClose
-//
 
 type OpenCloseConfig struct {
 	Symbol                 string
 	Qty                    float64
-	BuyMinutesBeforeOpen   int // legacy：这里保留，不删除
-	SellMinutesBeforeClose int // legacy：这里保留，不删除
+	BuyMinutesBeforeOpen   int
+	SellMinutesBeforeClose int
 
-	// 新增：用于反向策略
 	SellMinutesBeforeOpen int
 	BuyMinutesBeforeClose int
 
@@ -701,7 +730,6 @@ func (s *OpenCloseStrategy) Tick(ctx context.Context, acct *Account, clock *Cloc
 		now = time.Now().UTC()
 	}
 
-	// 盘前卖出：在开盘前几分钟卖掉持仓
 	if !clock.IsOpen && clock.NextOpen.After(now) {
 		timeUntilOpen := clock.NextOpen.Sub(now)
 		sellDateStr := clock.NextOpen.Format("2006-01-02")
@@ -713,7 +741,6 @@ func (s *OpenCloseStrategy) Tick(ctx context.Context, acct *Account, clock *Cloc
 		}
 	}
 
-	// 盘尾买入：在收盘前几分钟买入，准备持有到下一交易日开盘前
 	if clock.IsOpen && clock.NextClose.After(now) {
 		timeUntilClose := clock.NextClose.Sub(now)
 		buyDateStr := clock.NextClose.Format("2006-01-02")
@@ -727,12 +754,10 @@ func (s *OpenCloseStrategy) Tick(ctx context.Context, acct *Account, clock *Cloc
 	return nil
 }
 
-// 保留原函数名，但现在语义是“盘尾买入”
 func (s *OpenCloseStrategy) executeBuy(ctx context.Context, acct *Account, dateStr string) error {
 	return s.executeBuyBeforeClose(ctx, acct, dateStr)
 }
 
-// 保留原函数名，但现在语义是“盘前卖出”
 func (s *OpenCloseStrategy) executeSell(ctx context.Context, dateStr string) error {
 	return s.executeSellBeforeOpen(ctx, dateStr)
 }
@@ -786,7 +811,6 @@ func (s *OpenCloseStrategy) executeBuyBeforeClose(ctx context.Context, acct *Acc
 		return nil
 	}
 
-	// 盘尾买入前，避免已有仓位继续叠加
 	qtyHeld, err := currentPositionQty(ctx, s.client, s.cfg.Symbol)
 	if err != nil {
 		return err
@@ -854,7 +878,6 @@ func hasActiveOrder(ctx context.Context, client *AlpacaClient, symbol string) bo
 	return false
 }
 
-// 保留原函数名，兼容旧代码
 func hasOpenOrder(ctx context.Context, client *AlpacaClient, symbol string) bool {
 	return hasActiveOrder(ctx, client, symbol)
 }
@@ -930,12 +953,17 @@ type Bot struct {
 	globalLots        map[string][]PositionLot
 	globalRealizedPnL float64
 	lastPrices        map[string]float64
-	strategyStats     map[string]*StrategyStats
-	strategyLedgers   map[string]*strategyLedger
-	isRunning         bool
-	stopMu            sync.Mutex
-	stopFunc          context.CancelFunc
-	runCtx            context.Context
+
+	// 这里新增：保存账户当前真实仓位，用于策略持仓/盈亏统计
+	livePositions map[string]HoldingSummary
+
+	strategyStats   map[string]*StrategyStats
+	strategyLedgers map[string]*strategyLedger
+
+	isRunning bool
+	stopMu    sync.Mutex
+	stopFunc  context.CancelFunc
+	runCtx    context.Context
 }
 
 func NewBot(client *AlpacaClient, interval time.Duration) *Bot {
@@ -949,6 +977,7 @@ func NewBot(client *AlpacaClient, interval time.Duration) *Bot {
 		seenFillQty:     map[string]float64{},
 		globalLots:      map[string][]PositionLot{},
 		lastPrices:      map[string]float64{},
+		livePositions:   map[string]HoldingSummary{},
 		strategyStats:   map[string]*StrategyStats{},
 		strategyLedgers: map[string]*strategyLedger{},
 	}
@@ -984,9 +1013,23 @@ func (b *Bot) runOnce(ctx context.Context) {
 		}
 	}
 
+	positionsFetched := false
+	livePositions := make(map[string]HoldingSummary)
+	if positions, err := b.client.GetPositions(ctx); err == nil {
+		positionsFetched = true
+		for _, p := range positions {
+			sum := positionToHoldingSummary(p)
+			key := strings.ToUpper(strings.TrimSpace(sum.Symbol))
+			livePositions[key] = sum
+		}
+	}
+
 	b.mu.Lock()
 	for sym, price := range livePrices {
 		b.lastPrices[sym] = price
+	}
+	if positionsFetched {
+		b.livePositions = livePositions
 	}
 	b.recalcStrategyStatsLocked()
 	b.mu.Unlock()
@@ -1013,6 +1056,29 @@ func (b *Bot) runOnce(ctx context.Context) {
 		if err := s.Tick(ctx, acct, clock); err != nil {
 			b.logError(s.Name(), err.Error())
 		}
+	}
+}
+
+func positionToHoldingSummary(p Position) HoldingSummary {
+	qty := parseFloatString(p.Qty)
+	avg := parseFloatString(p.AvgEntryPrice)
+	mv := parseFloatString(p.MarketValue)
+	upnl := parseFloatString(p.UnrealizedPL)
+	cur := parseFloatString(p.CurrentPrice)
+
+	// 如果 current_price 没返回，尽量用 market_value / qty 反推
+	if cur <= 0 && qty > 0 && mv > 0 {
+		cur = mv / qty
+	}
+
+	return HoldingSummary{
+		Symbol:        p.Symbol,
+		Qty:           qty,
+		AvgEntryPrice: avg,
+		MarketValue:   mv,
+		UnrealizedPnL: upnl,
+		CurrentPrice:  cur,
+		Side:          p.Side,
 	}
 }
 
@@ -1157,6 +1223,37 @@ func (b *Bot) recalcStrategyStatsLocked() {
 		stat.TradeCount = ledger.tradeCount
 		stat.RealizedPnL = ledger.realizedPnL
 
+		// 优先使用账户里的真实持仓数据，避免 strategy ledger 因历史成交累计偏差导致仓位被放大
+		live, ok := b.livePositions[strings.ToUpper(strings.TrimSpace(stat.Symbol))]
+		if ok {
+			stat.PositionQty = live.Qty
+			stat.AvgCost = live.AvgEntryPrice
+
+			last := live.CurrentPrice
+			if last <= 0 {
+				last = b.lastPrices[stat.Symbol]
+			}
+			stat.LastPrice = last
+
+			// unrealized 直接采用真实持仓的未实现盈亏，和账户保持一致
+			// 如果 Alpaca 没返回这个字段，再 fallback 到按均价和现价自己算
+			if live.UnrealizedPnL != 0 || live.Qty == 0 {
+				stat.UnrealizedPnL = live.UnrealizedPnL
+			} else if live.Qty > 0 && stat.AvgCost > 0 && last > 0 {
+				if strings.ToLower(strings.TrimSpace(live.Side)) == "short" {
+					stat.UnrealizedPnL = live.Qty * (stat.AvgCost - last)
+				} else {
+					stat.UnrealizedPnL = live.Qty * (last - stat.AvgCost)
+				}
+			} else {
+				stat.UnrealizedPnL = 0
+			}
+
+			stat.TotalPnL = stat.RealizedPnL + stat.UnrealizedPnL
+			continue
+		}
+
+		// 如果实时仓位暂时不可用，保留原有 ledger 兜底逻辑
 		qty, cost, unrealized := 0.0, 0.0, 0.0
 		mark := b.lastPrices[stat.Symbol]
 
@@ -1269,15 +1366,7 @@ func (b *Bot) Positions(ctx context.Context) ([]HoldingSummary, error) {
 	}
 	out := make([]HoldingSummary, 0, len(positions))
 	for _, p := range positions {
-		out = append(out, HoldingSummary{
-			Symbol:        p.Symbol,
-			Qty:           parseFloatString(p.Qty),
-			AvgEntryPrice: parseFloatString(p.AvgEntryPrice),
-			MarketValue:   parseFloatString(p.MarketValue),
-			UnrealizedPnL: parseFloatString(p.UnrealizedPL),
-			CurrentPrice:  parseFloatString(p.CurrentPrice),
-			Side:          p.Side,
-		})
+		out = append(out, positionToHoldingSummary(p))
 	}
 	return out, nil
 }
@@ -1297,48 +1386,52 @@ func (b *Bot) Performance(ctx context.Context) (PerformanceSummary, error) {
 	}
 	currentEquity := parseFloatString(acct.Equity)
 
-	b.mu.RLock()
-	symbols := make([]string, 0, len(b.globalLots))
-	for sym := range b.globalLots {
-		symbols = append(symbols, sym)
+	// 1) 总盈亏：仍然按 Alpaca 7D history 的起点来算
+	periodEquity := b.initialEquity
+	if histEquity, err := b.client.GetPortfolioHistory7D(ctx); err == nil && histEquity > 0 {
+		periodEquity = histEquity
 	}
-	b.mu.RUnlock()
+	totalPnL := currentEquity - periodEquity
 
-	livePrices := make(map[string]float64)
-	for _, sym := range symbols {
-		if price, err := b.client.GetReferencePrice(ctx, sym); err == nil && price > 0 {
-			livePrices[sym] = price
-		}
+	// 2) 未实现盈亏：按当前未清仓持仓计算
+	positions, err := b.client.GetPositions(ctx)
+	if err != nil {
+		return PerformanceSummary{}, err
 	}
-
-	b.mu.RLock()
-	defer b.mu.RUnlock()
 
 	unrealized := 0.0
-	for sym, lots := range b.globalLots {
-		mark := livePrices[sym]
-		if mark <= 0 {
-			mark = b.lastPrices[sym]
+	for _, p := range positions {
+		qty := parseFloatString(p.Qty)
+		avg := parseFloatString(p.AvgEntryPrice)
+		cur := parseFloatString(p.CurrentPrice)
+		side := strings.ToLower(strings.TrimSpace(p.Side))
+
+		if qty <= 0 || avg <= 0 || cur <= 0 {
+			continue
 		}
-		if mark > 0 {
-			for _, lot := range lots {
-				unrealized += lot.Qty * (mark - lot.Price)
-			}
+
+		if side == "short" {
+			unrealized += qty * (avg - cur)
+		} else {
+			unrealized += qty * (cur - avg)
 		}
 	}
 
-	total := b.globalRealizedPnL + unrealized
+	// 3) 已实现盈亏：用总盈亏 - 未实现盈亏 做拆分
+	realized := totalPnL - unrealized
+
+	// 4) 收益率：改成机器人启动以来的收益率，避免 7D 基准导致百分比异常
 	ret := 0.0
 	if b.initialEquity > 0 {
-		ret = total / b.initialEquity * 100
+		ret = (currentEquity - b.initialEquity) / b.initialEquity * 100
 	}
 
 	return PerformanceSummary{
-		InitialEquity: b.initialEquity,
+		InitialEquity: periodEquity,
 		CurrentEquity: currentEquity,
-		RealizedPnL:   b.globalRealizedPnL,
+		RealizedPnL:   realized,
 		UnrealizedPnL: unrealized,
-		TotalPnL:      total,
+		TotalPnL:      totalPnL,
 		ReturnPct:     ret,
 	}, nil
 }

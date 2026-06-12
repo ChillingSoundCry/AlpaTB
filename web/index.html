@@ -52,7 +52,6 @@
                         </div>
                     </div>
                     <div class="flex items-center gap-3">
-                        <!-- 状态指示（使用 account.status） -->
                         <div class="hidden sm:flex items-center gap-2 text-sm"
                              :class="dashboard.account.status === 'running' ? 'text-emerald-600' : 'text-slate-400'">
                             <span class="relative flex h-2.5 w-2.5">
@@ -77,7 +76,6 @@
         </header>
 
         <main class="flex-1 pb-14">
-            <!-- 账户表现与资产构成 -->
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6">
                 <div class="grid lg:grid-cols-[1.5fr_1fr] gap-5">
                     <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
@@ -123,7 +121,6 @@
                 </div>
             </section>
 
-            <!-- 权益曲线 -->
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
                 <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
                     <div class="flex justify-between mb-3">
@@ -135,7 +132,6 @@
                 </div>
             </section>
 
-            <!-- 策略面板 -->
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
                 <div class="flex justify-between mb-4">
                     <h2 class="text-xl font-bold">运行策略面板</h2>
@@ -172,7 +168,6 @@
                 </div>
             </section>
 
-            <!-- 持仓 & 成交表格 -->
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6 grid lg:grid-cols-2 gap-5">
                 <div class="glass rounded-2xl p-5 shadow-soft">
                     <h2 class="text-lg font-bold mb-4">当前持仓</h2>
@@ -239,7 +234,6 @@
             </section>
         </main>
 
-        <!-- 策略详情弹窗 -->
         <teleport to="body">
             <div v-if="selectedStrategy" class="fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="closeStrategy">
                 <div class="absolute inset-0 bg-slate-900/50 backdrop-blur-sm"></div>
@@ -302,14 +296,18 @@
                                     </div>
                                 </div>
                             </div>
-                            <!-- 当前挂单 -->
+
                             <div class="border rounded-xl p-4">
                                 <h4 class="text-sm font-bold mb-2">当前挂单</h4>
-                                <div v-if="!selectedStrategy.orders.filter(o => o.status === 'open').length" class="text-sm text-slate-500 text-center py-4">无挂单</div>
+                                <div v-if="!selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'new').length" class="text-sm text-slate-500 text-center py-4">无挂单</div>
                                 <div v-else class="space-y-3">
-                                    <div v-for="o in selectedStrategy.orders.filter(o => o.status === 'open')" :key="o.id" class="flex justify-between text-sm border-b pb-2">
+                                    <div v-for="o in selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'new')" :key="o.id" class="flex justify-between text-sm border-b pb-2">
                                         <div>
-                                            <div class="font-bold">{{ o.symbol }} <span class="text-xs" :class="o.side==='buy'?'text-emerald-600':'text-rose-600'">{{ o.side }}</span> <span class="ml-2 text-xs text-slate-500">{{ o.type }}</span></div>
+                                            <div class="font-bold">
+                                                {{ o.symbol }}
+                                                <span class="text-xs" :class="o.side==='buy'?'text-emerald-600':'text-rose-600'">{{ o.side }}</span>
+                                                <span class="ml-2 text-xs text-slate-500">{{ o.type }}</span>
+                                            </div>
                                             <div class="text-xs text-slate-500">限价: {{ formatPrice(o.limit_price) }}</div>
                                             <div class="text-xs text-slate-400">{{ o.created_at ? formatTime(o.created_at) : '--' }}</div>
                                         </div>
@@ -320,6 +318,29 @@
                                     </div>
                                 </div>
                             </div>
+
+                            <div class="border rounded-xl p-4">
+                                <h4 class="text-sm font-bold mb-2">已成交订单</h4>
+                                <div v-if="!selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'filled').length" class="text-sm text-slate-500 text-center py-4">无已成交订单</div>
+                                <div v-else class="space-y-3">
+                                    <div v-for="o in selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'filled')" :key="o.id" class="flex justify-between text-sm border-b pb-2">
+                                        <div>
+                                            <div class="font-bold">
+                                                {{ o.symbol }}
+                                                <span class="text-xs" :class="o.side==='buy'?'text-emerald-600':'text-rose-600'">{{ o.side }}</span>
+                                                <span class="ml-2 text-xs text-slate-500">{{ o.type }}</span>
+                                            </div>
+                                            <div class="text-xs text-slate-500">成交价: {{ formatPrice(o.filled_avg_price || o.limit_price) }}</div>
+                                            <div class="text-xs text-slate-400">{{ o.filled_at ? formatTime(o.filled_at) : (o.updated_at ? formatTime(o.updated_at) : '--') }}</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div>{{ o.qty }} 股</div>
+                                            <div class="text-xs text-emerald-600">状态: filled</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
                             <div class="border rounded-xl p-4 flex-1 flex flex-col min-h-0">
                                 <h4 class="text-sm font-bold mb-2">成交明细</h4>
                                 <div class="overflow-y-auto flex-1 space-y-2">
@@ -376,6 +397,8 @@
                 let equityChart = null;
                 let strategyChart = null;
 
+                const normalizeStatus = (status) => String(status || '').trim().toLowerCase();
+
                 const formatPrice = (v) => {
                     const n = Number(v || 0);
                     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -431,7 +454,11 @@
                             Object.values(data.trades_by_strategy).forEach(g => trades.push(...g.trades));
                         }
                         allTrades.value = trades.sort((a, b) => new Date(b.time) - new Date(a.time));
-                    } catch (e) { console.error(e); } finally { loading.value = false; }
+                    } catch (e) {
+                        console.error(e);
+                    } finally {
+                        loading.value = false;
+                    }
                 };
 
                 const renderEquityChart = () => {
@@ -476,7 +503,9 @@
                             return data.sort((a, b) => (a.t || 0) - (b.t || 0));
                         }
                         return data;
-                    } catch { return null; }
+                    } catch {
+                        return null;
+                    }
                 };
 
                 const renderStrategyChart = async (strategy) => {
@@ -553,22 +582,25 @@
 
                     const option = {
                         title: chartTitle ? { text: chartTitle, left: 'center', top: 0, textStyle: { fontSize: 12, color: '#64748b', fontWeight: 'normal' } } : undefined,
-                        tooltip: { trigger: 'axis', formatter: (params) => {
-                            if (!params || params.length === 0) return '';
-                            const p = params[0];
-                            let html = `<b>${p.axisValue}</b><br/>`;
-                            if (p.seriesType === 'line') {
-                                html += `收盘价: <b>$${Number(p.value).toFixed(2)}</b>`;
-                                if (bars && bars.length > 0 && p.dataIndex < bars.length) {
-                                    const bar = bars[p.dataIndex];
-                                    html += `<br/>开盘: $${Number(bar.o || 0).toFixed(2)}`;
-                                    html += `<br/>最高: $${Number(bar.h || 0).toFixed(2)}`;
-                                    html += `<br/>最低: $${Number(bar.l || 0).toFixed(2)}`;
-                                    html += `<br/>成交量: ${bar.v || 0}`;
+                        tooltip: {
+                            trigger: 'axis',
+                            formatter: (params) => {
+                                if (!params || params.length === 0) return '';
+                                const p = params[0];
+                                let html = `<b>${p.axisValue}</b><br/>`;
+                                if (p.seriesType === 'line') {
+                                    html += `收盘价: <b>$${Number(p.value).toFixed(2)}</b>`;
+                                    if (bars && bars.length > 0 && p.dataIndex < bars.length) {
+                                        const bar = bars[p.dataIndex];
+                                        html += `<br/>开盘: $${Number(bar.o || 0).toFixed(2)}`;
+                                        html += `<br/>最高: $${Number(bar.h || 0).toFixed(2)}`;
+                                        html += `<br/>最低: $${Number(bar.l || 0).toFixed(2)}`;
+                                        html += `<br/>成交量: ${bar.v || 0}`;
+                                    }
                                 }
+                                return html;
                             }
-                            return html;
-                        }},
+                        },
                         grid: { left: '8%', right: '8%', top: chartTitle ? '14%' : '10%', bottom: '12%' },
                         xAxis: { data: xData, axisLabel: { fontSize: 10, rotate: xData.length > 12 ? 35 : 0, interval: xData.length > 20 ? Math.floor(xData.length / 12) : 0 } },
                         yAxis: { scale: true, axisLabel: { fontSize: 10, formatter: (v) => '$' + Number(v || 0).toFixed(2) }, splitLine: { lineStyle: { color: '#f1f5f9', type: 'dashed' } } },
@@ -591,8 +623,8 @@
                 };
 
                 const handleAllResize = () => {
-                    try { if (equityChart) equityChart.resize(); } catch (e) { /* ignore */ }
-                    try { if (strategyChart) strategyChart.resize(); } catch (e) { /* ignore */ }
+                    try { if (equityChart) equityChart.resize(); } catch (e) {}
+                    try { if (strategyChart) strategyChart.resize(); } catch (e) {}
                 };
                 window.addEventListener('resize', handleAllResize);
 
@@ -603,7 +635,11 @@
                         const res = await fetch(`${API_BASE}/api/liquidate`, { method: 'POST' });
                         if (!res.ok) throw new Error(await res.text());
                         await loadDashboard();
-                    } catch (e) { alert('平仓失败: ' + e.message); } finally { liquidating.value = false; }
+                    } catch (e) {
+                        alert('平仓失败: ' + e.message);
+                    } finally {
+                        liquidating.value = false;
+                    }
                 };
 
                 const restartBot = async () => {
@@ -613,7 +649,11 @@
                         const res = await fetch(`${API_BASE}/api/restart`, { method: 'POST' });
                         if (!res.ok) throw new Error(await res.text());
                         await loadDashboard();
-                    } catch (e) { alert('重启失败: ' + e.message); } finally { restarting.value = false; }
+                    } catch (e) {
+                        alert('重启失败: ' + e.message);
+                    } finally {
+                        restarting.value = false;
+                    }
                 };
 
                 onMounted(() => {
@@ -624,7 +664,7 @@
                     loading, liquidating, restarting, strategyChartLoading, strategyBarsCount,
                     dashboard, allTrades, selectedStrategy,
                     formatNumber, formatPrice, formatCurrency, formatSignedCurrency, formatSignedPercent,
-                    colorClass, formatTime,
+                    colorClass, formatTime, normalizeStatus,
                     loadDashboard, openStrategy, closeStrategy, liquidateAll, restartBot
                 };
             }

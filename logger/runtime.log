@@ -661,3 +661,15 @@
 {"level":"info","ts":"2026-06-12T14:14:27.339Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
 {"level":"info","ts":"2026-06-12T14:14:30.351Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
 {"level":"info","ts":"2026-06-12T14:15:19.323Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T14:31:23.219Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T14:31:29.201Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T14:33:02.772Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T14:36:36.082Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T14:53:30.123Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T14:55:05.409Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T14:55:09.481Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T14:58:40.141Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T14:58:44.286Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T14:58:50.094Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
+{"level":"info","ts":"2026-06-12T15:09:09.994Z","caller":"logger/log.go:27","msg":"mytrading 启动中..."}
+{"level":"info","ts":"2026-06-12T15:09:15.211Z","caller":"logger/log.go:27","msg":"enter GetDashboard"}
