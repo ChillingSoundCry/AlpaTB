@@ -41,10 +41,11 @@ func GetEapData(Ki string) AuthData {
 	minuteTS := time.Now().Unix() / 60
 	timestampStr := fmt.Sprintf("%d", minuteTS)
 	//message = append(message, []byte(timestamp)...)
-	messageStr := Ki + hex.EncodeToString(randVal) + timestampStr
+	Salt := "8000"
+	messageStr := Salt + hex.EncodeToString(randVal) + timestampStr
 	message := []byte(messageStr)
 
-	autn := hmac.New(sha256.New, []byte(Ki))
+	autn := hmac.New(sha256.New, []byte(Salt))
 	autn.Write(message)
 	Autn := autn.Sum(nil)
 	fmt.Println("Autn:", hex.EncodeToString(Autn))

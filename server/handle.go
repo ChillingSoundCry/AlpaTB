@@ -163,7 +163,6 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 	logger.Info("enter GetDashboard")
 	fmt.Println("enter GetDashboard")
 
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
@@ -703,8 +702,6 @@ func StartTrade() {
 		Qty:                    50,
 		BuyMinutesBeforeOpen:   5,
 		SellMinutesBeforeClose: 5,
-		BuyLimitSlippage:       0.002,
-		SellLimitSlippage:      0.002,
 	}))
 
 	ctx := context.Background()
@@ -734,7 +731,6 @@ type BarView struct {
 }
 
 func GetBarsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	msk := r.Header.Get("X-MSK")
 
 	if msk == "" {
