@@ -685,11 +685,29 @@ func StartTrade() {
 
 	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
 		Symbol:      "LEU",
-		Levels:      4,
-		SpacingPct:  0.025,
+		Levels:      6,
+		SpacingPct:  0.01,
 		QtyPerOrder: 5,
 		SeedQty:     20,
-		RecenterPct: 0.15,
+		RecenterPct: 0.03,
+	}))
+
+	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
+		Symbol:      "APLD",
+		Levels:      6,
+		SpacingPct:  0.01,
+		QtyPerOrder: 5,
+		SeedQty:     20,
+		RecenterPct: 0.03,
+	}))
+
+	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
+		Symbol:      "LITE",
+		Levels:      6,
+		SpacingPct:  0.01,
+		QtyPerOrder: 5,
+		SeedQty:     20,
+		RecenterPct: 0.03,
 	}))
 
 	bot.RegisterStrategy(process.NewOpenCloseStrategy(client, process.OpenCloseConfig{

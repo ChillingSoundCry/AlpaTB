@@ -463,7 +463,9 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	}
 }
 
-func (g *GridStrategy) Name() string   { return "grid" }
+func (g *GridStrategy) Name() string {
+	return "grid-" + strings.ToUpper(strings.TrimSpace(g.cfg.Symbol))
+}
 func (g *GridStrategy) Symbol() string { return g.cfg.Symbol }
 func (g *GridStrategy) Config() map[string]interface{} {
 	return map[string]interface{}{
@@ -801,7 +803,9 @@ func NewOpenCloseStrategy(client *AlpacaClient, cfg OpenCloseConfig) *OpenCloseS
 	}
 }
 
-func (s *OpenCloseStrategy) Name() string   { return "open-close" }
+func (s *OpenCloseStrategy) Name() string {
+	return "open-close-" + strings.ToUpper(strings.TrimSpace(s.cfg.Symbol))
+}
 func (s *OpenCloseStrategy) Symbol() string { return s.cfg.Symbol }
 func (s *OpenCloseStrategy) Config() map[string]interface{} {
 	return map[string]interface{}{
@@ -1193,7 +1197,7 @@ func (b *Bot) syncOrderFills(ctx context.Context) error {
 		if o.FilledAt != nil {
 			fillTime = *o.FilledAt
 		}
-		stratName := detectStrategyName(o.ClientOrderID)
+		stratName := detectStrategyName(o.ClientOrderID, o.Symbol)
 		b.tradeRecords = append(b.tradeRecords, TradeRecord{
 			Time:          fillTime,
 			Symbol:        o.Symbol,
@@ -1220,18 +1224,19 @@ func (b *Bot) syncOrderFills(ctx context.Context) error {
 	return nil
 }
 
-func detectStrategyName(clientOrderID string) string {
+func detectStrategyName(clientOrderID, symbol string) string {
 	id := strings.ToLower(strings.TrimSpace(clientOrderID))
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
 	switch {
 	case strings.Contains(id, "grid"):
-		return "grid"
+		return "grid-" + sym
 	case strings.Contains(id, "open-sell"),
 		strings.Contains(id, "close-buy"),
 		strings.Contains(id, "open-buy"),
 		strings.Contains(id, "close-sell"),
 		strings.Contains(id, "open-close"),
 		strings.Contains(id, "overnight"):
-		return "open-close"
+		return "open-close-" + sym
 	default:
 		return "unknown"
 	}
@@ -1716,7 +1721,7 @@ func (b *Bot) handleTradeUpdate(update TradeUpdateEnvelope) {
 		}
 	}
 
-	stratName := detectStrategyName(data.Order.ClientOrderID)
+	stratName := detectStrategyName(data.Order.ClientOrderID, symbol)
 	b.tradeRecords = append(b.tradeRecords, TradeRecord{
 		Time:          fillTime,
 		Symbol:        symbol,
@@ -1794,7 +1799,7 @@ func (b *Bot) AllOrders(ctx context.Context) ([]OrderSummary, error) {
 		if o.CreatedAt != nil {
 			createdAt = o.CreatedAt.Format(time.RFC3339)
 		}
-		strategy := detectStrategyName(o.ClientOrderID)
+		strategy := detectStrategyName(o.ClientOrderID, o.Symbol)
 		out = append(out, OrderSummary{
 			ID:            o.ID,
 			ClientOrderID: o.ClientOrderID,
@@ -1978,7 +1983,8 @@ func printRichDashboard(ctx context.Context, bot *Bot) error {
 	fmt.Printf("\n [ 策略状态 ]\n")
 	summaries, _ := bot.StrategySummaries(ctx)
 	for _, stat := range summaries {
-		fmt.Printf("  %-12s | 标的: %-5s | 持仓: %-6.2f | PnL: $%+.2f \n",
+		// 修改了排版占位符以容纳更长的带有 Symbol 的策略名称
+		fmt.Printf("  %-16s | 标的: %-5s | 持仓: %-6.2f | PnL: $%+.2f \n",
 			stat.Name, stat.Symbol, stat.PositionQty, stat.TotalPnL)
 	}
 	if len(positions) > 0 {
