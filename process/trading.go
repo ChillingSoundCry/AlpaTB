@@ -319,6 +319,10 @@ func parseFloatString(s string) float64 {
 	return f
 }
 
+func gridPriceKey(price float64) string {
+	return fmt.Sprintf("%.2f", price)
+}
+
 func isHTTPStatusError(err error, code int) bool {
 	if err == nil {
 		return false
@@ -579,23 +583,35 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingB
 
 	isUptrend := g.checkTrendMA20(ctx) // 趋势过滤检查
 	availableSellQty := posQty
+	usedBuyPrices := map[string]bool{}
+	usedSellPrices := map[string]bool{}
+
 	for i := 1; i <= g.cfg.Levels; i++ {
 		off := float64(i) * g.cfg.SpacingPct
 		buyPrice := center * (1 - off)
 		sellPrice := center * (1 + off)
 
-		if buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
-			projectedQty := posQty + pendingBuyQty + g.cfg.QtyPerOrder*float64(i)
+		buyKey := gridPriceKey(buyPrice)
+		sellKey := gridPriceKey(sellPrice)
+
+		if !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
+			projectedQty := posQty + pendingBuyQty + g.cfg.QtyPerOrder
 			if g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty {
-				buyingPower = g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
+				newBP := g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
+				if newBP < buyingPower {
+					buyingPower = newBP
+					pendingBuyQty += g.cfg.QtyPerOrder
+					usedBuyPrices[buyKey] = true
+				}
 			}
 		}
 
-		if sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
+		if !usedSellPrices[sellKey] && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
 			qty := math.Min(g.cfg.QtyPerOrder, availableSellQty)
 			if qty > 0 {
 				g.placeSellIfSafe(ctx, i, sellPrice, qty)
 				availableSellQty -= qty
+				usedSellPrices[sellKey] = true
 			}
 		}
 	}
@@ -603,48 +619,56 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingB
 }
 
 func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pendingBuyQty float64, openOrders []Order, buyingPower float64) error {
-	openBuyPrices := map[int]bool{}
-	openSellPrices := map[int]bool{}
+	openBuyPrices := map[string]bool{}
+	openSellPrices := map[string]bool{}
 	openSellQty := 0.0
+
 	for _, o := range openOrders {
-		p := parseFloatString(o.LimitPrice)
-		idx := g.levelIndex(center, p)
-		if idx > 0 && idx <= g.cfg.Levels {
-			key := fmt.Sprintf("%s-%d", strings.ToLower(o.Side), idx)
-			delete(g.pendingOrders, key)
-			if strings.ToLower(o.Side) == "buy" {
-				openBuyPrices[idx] = true
-			} else {
-				openSellPrices[idx] = true
-				openSellQty += parseFloatString(o.Qty)
-			}
+		priceKey := gridPriceKey(parseFloatString(o.LimitPrice))
+		side := strings.ToLower(strings.TrimSpace(o.Side))
+		if priceKey == "0.00" {
+			continue
+		}
+		delete(g.pendingOrders, side+"-"+priceKey)
+		switch side {
+		case "buy":
+			openBuyPrices[priceKey] = true
+		case "sell":
+			openSellPrices[priceKey] = true
+			openSellQty += parseFloatString(o.Qty)
 		}
 	}
 
 	isUptrend := g.checkTrendMA20(ctx)
 	availableSellQty := math.Max(0, posQty-openSellQty)
+	usedBuyPrices := map[string]bool{}
+	usedSellPrices := map[string]bool{}
 
 	for i := 1; i <= g.cfg.Levels; i++ {
 		off := float64(i) * g.cfg.SpacingPct
 		buyPrice := center * (1 - off)
 		sellPrice := center * (1 + off)
 
-		// Auto replenish missing Buy order
-		if !openBuyPrices[i] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
-			// [修复点 3] 计算补仓后的合计买入敞口时，累计已有的 pendingBuyQty
+		buyKey := gridPriceKey(buyPrice)
+		sellKey := gridPriceKey(sellPrice)
+
+		if !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
 			if g.cfg.MaxPositionQty <= 0 || (posQty+pendingBuyQty+g.cfg.QtyPerOrder) <= g.cfg.MaxPositionQty {
-				buyingPower = g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
-				// 新增买单后，更新挂单总量累加器，供后续 level 判断使用
-				pendingBuyQty += g.cfg.QtyPerOrder
+				newBP := g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
+				if newBP < buyingPower {
+					buyingPower = newBP
+					pendingBuyQty += g.cfg.QtyPerOrder
+					usedBuyPrices[buyKey] = true
+				}
 			}
 		}
 
-		// Auto replenish missing Sell order
-		if !openSellPrices[i] && availableSellQty > 0 && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
+		if !usedSellPrices[sellKey] && !openSellPrices[sellKey] && availableSellQty > 0 && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
 			qty := math.Min(g.cfg.QtyPerOrder, availableSellQty)
 			if qty > 0 {
 				g.placeSellIfSafe(ctx, i, sellPrice, qty)
 				availableSellQty -= qty
+				usedSellPrices[sellKey] = true
 			}
 		}
 	}
@@ -652,7 +676,8 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pending
 }
 
 func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty, bp float64) float64 {
-	key := fmt.Sprintf("buy-%d", level)
+	priceKey := gridPriceKey(price)
+	key := "buy-" + priceKey
 	if g.isPending(key) {
 		return bp
 	}
@@ -666,8 +691,8 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 		Side:          "buy",
 		Type:          "limit",
 		TimeInForce:   "day",
-		LimitPrice:    fmt.Sprintf("%.2f", price),
-		ClientOrderID: fmt.Sprintf("grid-buy-%s-%d-%d", g.cfg.Symbol, level, time.Now().UnixNano()),
+		LimitPrice:    priceKey,
+		ClientOrderID: fmt.Sprintf("grid-buy-%s-%d-%s-%d", g.cfg.Symbol, level, priceKey, time.Now().UnixNano()),
 	})
 	if err == nil {
 		g.pendingOrders[key] = time.Now()
@@ -677,7 +702,8 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 }
 
 func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qty float64) {
-	key := fmt.Sprintf("sell-%d", level)
+	priceKey := gridPriceKey(price)
+	key := "sell-" + priceKey
 	if g.isPending(key) {
 		return
 	}
@@ -687,8 +713,8 @@ func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qt
 		Side:          "sell",
 		Type:          "limit",
 		TimeInForce:   "day",
-		LimitPrice:    fmt.Sprintf("%.2f", price),
-		ClientOrderID: fmt.Sprintf("grid-sell-%s-%d-%d", g.cfg.Symbol, level, time.Now().UnixNano()),
+		LimitPrice:    priceKey,
+		ClientOrderID: fmt.Sprintf("grid-sell-%s-%d-%s-%d", g.cfg.Symbol, level, priceKey, time.Now().UnixNano()),
 	})
 	if err == nil {
 		g.pendingOrders[key] = time.Now()
@@ -1523,21 +1549,20 @@ func printRichDashboard(ctx context.Context, bot *Bot) error {
 	equity := parseFloatString(acct.Equity)
 	cash := parseFloatString(acct.Cash)
 	bp := parseFloatString(acct.BuyingPower)
-	fmt.Printf("\n========================================================================\n")
-	fmt.Printf(" 🤖 实时量化面板 | 时间: %s | 运行: %s\n", time.Now().Format("15:04:05"), runtimeStr)
+	fmt.Printf(" 实时量化面板 | 时间: %s | 运行: %s\n", time.Now().Format("15:04:05"), runtimeStr)
 	fmt.Printf(" -----------------------------------------------------------------------\n")
-	fmt.Printf(" 🏦 资产: $%-.2f | 💵 现金: $%-.2f | ⚡ 购买力: $%-.2f\n", equity, cash, bp)
-	fmt.Printf(" 📊 交易笔数: %d 笔 \n", totalTrades)
-	fmt.Printf("\n [ 📈 策略状态 ]\n")
+	fmt.Printf(" 资产: $%-.2f | 现金: $%-.2f | 购买力: $%-.2f\n", equity, cash, bp)
+	fmt.Printf(" 交易笔数: %d 笔 \n", totalTrades)
+	fmt.Printf("\n [ 策略状态 ]\n")
 	summaries, _ := bot.StrategySummaries(ctx)
 	for _, stat := range summaries {
-		fmt.Printf(" ► %-12s | 标的: %-5s | 持仓: %-6.2f | PnL: $%+.2f \n",
+		fmt.Printf("  %-12s | 标的: %-5s | 持仓: %-6.2f | PnL: $%+.2f \n",
 			stat.Name, stat.Symbol, stat.PositionQty, stat.TotalPnL)
 	}
 	if len(positions) > 0 {
-		fmt.Printf("\n [ 💼 实时仓位 ]\n")
+		fmt.Printf("\n [ 实时仓位 ]\n")
 		for _, p := range positions {
-			fmt.Printf("  ► %-5s | 数量: %-6s | 均价: $%-.2f | 现价: $%-.2f \n",
+			fmt.Printf("   %-5s | 数量: %-6s | 均价: $%-.2f | 现价: $%-.2f \n",
 				p.Symbol, p.Qty, parseFloatString(p.AvgEntryPrice), parseFloatString(p.CurrentPrice))
 		}
 	}
