@@ -77,6 +77,7 @@ func AuthVerify(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 
 		w.Write([]byte("ip blocked"))
+		logger.Info("ip blocked")
 
 		return
 	}

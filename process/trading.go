@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	_ "time/tzdata"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -76,22 +78,28 @@ func getenvDefault(key, def string) string {
 // -----------------------
 
 type AlpacaClient struct {
-	baseURL string
-	dataURL string
-	feed    string
-	apiKey  string
-	secret  string
-	client  *http.Client
+	baseURL    string
+	dataURL    string
+	feed       string
+	apiKey     string
+	secret     string
+	client     *http.Client
+	priceCache *PriceCache
+
+	wsMu          sync.Mutex
+	marketCancel  context.CancelFunc
+	tradingCancel context.CancelFunc
 }
 
 func NewAlpacaClient(cfg Config) *AlpacaClient {
 	return &AlpacaClient{
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		dataURL: strings.TrimRight(cfg.DataURL, "/"),
-		feed:    cfg.DataFeed,
-		apiKey:  cfg.APIKey,
-		secret:  cfg.APISecret,
-		client:  &http.Client{Timeout: cfg.HTTPTimeout},
+		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
+		dataURL:    strings.TrimRight(cfg.DataURL, "/"),
+		feed:       cfg.DataFeed,
+		apiKey:     cfg.APIKey,
+		secret:     cfg.APISecret,
+		client:     &http.Client{Timeout: cfg.HTTPTimeout},
+		priceCache: NewPriceCache(),
 	}
 }
 
@@ -287,15 +295,27 @@ func (c *AlpacaClient) CancelOrder(ctx context.Context, orderID string) error {
 }
 
 func (c *AlpacaClient) GetReferencePrice(ctx context.Context, symbol string) (float64, error) {
+	if c.priceCache != nil {
+		if price, ok := c.priceCache.Get(symbol); ok && price > 0 {
+			return price, nil
+		}
+	}
 	var qResp QuoteResponse
 	if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/v2/stocks/%s/quotes/latest?feed=%s", c.dataURL, symbol, c.feed), nil, &qResp); err == nil {
 		if qResp.Quote.AskPrice > 0 && qResp.Quote.BidPrice > 0 {
-			return (qResp.Quote.AskPrice + qResp.Quote.BidPrice) / 2.0, nil
+			price := (qResp.Quote.AskPrice + qResp.Quote.BidPrice) / 2.0
+			if c.priceCache != nil && price > 0 {
+				c.priceCache.Set(symbol, price)
+			}
+			return price, nil
 		}
 	}
 	var tResp TradeResponse
 	if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/v2/stocks/%s/trades/latest?feed=%s", c.dataURL, symbol, c.feed), nil, &tResp); err == nil {
 		if tResp.Trade.Price > 0 {
+			if c.priceCache != nil {
+				c.priceCache.Set(symbol, tResp.Trade.Price)
+			}
 			return tResp.Trade.Price, nil
 		}
 	}
@@ -749,12 +769,10 @@ func (g *GridStrategy) levelIndex(center, price float64) int {
 // -----------------------
 
 type OpenCloseConfig struct {
-	Symbol                 string
-	Qty                    float64
-	BuyMinutesBeforeOpen   int
-	SellMinutesBeforeClose int
-	SellMinutesBeforeOpen  int
-	BuyMinutesBeforeClose  int
+	Symbol                string
+	Qty                   float64
+	SellMinutesBeforeOpen int
+	BuyMinutesBeforeClose int
 }
 
 type OpenCloseStrategy struct {
@@ -770,12 +788,7 @@ func NewOpenCloseStrategy(client *AlpacaClient, cfg OpenCloseConfig) *OpenCloseS
 	if cfg.Qty <= 0 {
 		cfg.Qty = 1
 	}
-	if cfg.SellMinutesBeforeOpen <= 0 {
-		cfg.SellMinutesBeforeOpen = cfg.BuyMinutesBeforeOpen
-	}
-	if cfg.BuyMinutesBeforeClose <= 0 {
-		cfg.BuyMinutesBeforeClose = cfg.SellMinutesBeforeClose
-	}
+
 	if cfg.SellMinutesBeforeOpen <= 0 {
 		cfg.SellMinutesBeforeOpen = 5
 	}
@@ -792,12 +805,10 @@ func (s *OpenCloseStrategy) Name() string   { return "open-close" }
 func (s *OpenCloseStrategy) Symbol() string { return s.cfg.Symbol }
 func (s *OpenCloseStrategy) Config() map[string]interface{} {
 	return map[string]interface{}{
-		"symbol":                    s.cfg.Symbol,
-		"qty":                       s.cfg.Qty,
-		"buy_minutes_before_open":   s.cfg.BuyMinutesBeforeOpen,
-		"sell_minutes_before_close": s.cfg.SellMinutesBeforeClose,
-		"sell_minutes_before_open":  s.cfg.SellMinutesBeforeOpen,
-		"buy_minutes_before_close":  s.cfg.BuyMinutesBeforeClose,
+		"symbol":                   s.cfg.Symbol,
+		"qty":                      s.cfg.Qty,
+		"sell_minutes_before_open": s.cfg.SellMinutesBeforeOpen,
+		"buy_minutes_before_close": s.cfg.BuyMinutesBeforeClose,
 	}
 }
 
@@ -1019,6 +1030,7 @@ type Bot struct {
 	stopMu            sync.Mutex
 	stopFunc          context.CancelFunc
 	runCtx            context.Context
+	useWebSockets     bool
 }
 
 func NewBot(client *AlpacaClient, interval time.Duration) *Bot {
@@ -1035,6 +1047,7 @@ func NewBot(client *AlpacaClient, interval time.Duration) *Bot {
 		livePositions:   map[string]HoldingSummary{},
 		strategyStats:   map[string]*StrategyStats{},
 		strategyLedgers: map[string]*strategyLedger{},
+		useWebSockets:   true,
 	}
 }
 
@@ -1052,7 +1065,6 @@ func (b *Bot) RegisterStrategy(s Strategy) {
 
 func (b *Bot) runOnce(ctx context.Context) {
 	b.recordSnapshot(ctx)
-	_ = b.syncOrderFills(ctx)
 	b.mu.RLock()
 	symbols := make([]string, 0, len(b.strategies))
 	for _, s := range b.strategies {
@@ -1328,6 +1340,416 @@ func (b *Bot) recalcStrategyStatsLocked() {
 		stat.LastPrice = mark
 		stat.UnrealizedPnL = unrealized
 		stat.TotalPnL = stat.RealizedPnL + stat.UnrealizedPnL
+	}
+}
+
+// -----------------------
+// WebSocket Streaming
+// -----------------------
+
+type PriceCache struct {
+	mu     sync.RWMutex
+	prices map[string]float64
+}
+
+func NewPriceCache() *PriceCache {
+	return &PriceCache{prices: map[string]float64{}}
+}
+
+func (pc *PriceCache) Set(symbol string, price float64) {
+	if pc == nil || symbol == "" || price <= 0 {
+		return
+	}
+	pc.mu.Lock()
+	pc.prices[strings.ToUpper(strings.TrimSpace(symbol))] = price
+	pc.mu.Unlock()
+}
+
+func (pc *PriceCache) Get(symbol string) (float64, bool) {
+	if pc == nil {
+		return 0, false
+	}
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	v, ok := pc.prices[strings.ToUpper(strings.TrimSpace(symbol))]
+	return v, ok && v > 0
+}
+
+func (pc *PriceCache) Snapshot() map[string]float64 {
+	if pc == nil {
+		return map[string]float64{}
+	}
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	out := make(map[string]float64, len(pc.prices))
+	for k, v := range pc.prices {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *AlpacaClient) AttachPriceCache(cache *PriceCache) {
+	c.priceCache = cache
+}
+
+func (c *AlpacaClient) CachePrice(symbol string, price float64) {
+	if c.priceCache != nil {
+		c.priceCache.Set(symbol, price)
+	}
+}
+
+func (c *AlpacaClient) LatestPrice(symbol string) (float64, bool) {
+	if c.priceCache == nil {
+		return 0, false
+	}
+	return c.priceCache.Get(symbol)
+}
+
+func (c *AlpacaClient) marketStreamURL() string {
+	feed := strings.TrimSpace(c.feed)
+	if feed == "" {
+		feed = "iex"
+	}
+	if strings.Contains(strings.ToLower(c.dataURL), "sandbox") {
+		return fmt.Sprintf("wss://stream.data.sandbox.alpaca.markets/v2/%s", feed)
+	}
+	return fmt.Sprintf("wss://stream.data.alpaca.markets/v2/%s", feed)
+}
+
+func (c *AlpacaClient) tradingStreamURL() string {
+	if strings.Contains(strings.ToLower(c.baseURL), "sandbox") {
+		return "wss://paper-api.sandbox.alpaca.markets/stream"
+	}
+	if strings.Contains(strings.ToLower(c.baseURL), "paper") {
+		return "wss://paper-api.alpaca.markets/stream"
+	}
+	return "wss://api.alpaca.markets/stream"
+}
+
+func (c *AlpacaClient) CloseStreams() {
+	c.wsMu.Lock()
+	if c.marketCancel != nil {
+		c.marketCancel()
+		c.marketCancel = nil
+	}
+	if c.tradingCancel != nil {
+		c.tradingCancel()
+		c.tradingCancel = nil
+	}
+	c.wsMu.Unlock()
+}
+
+func (c *AlpacaClient) StartMarketDataStream(ctx context.Context, symbols []string) {
+	c.wsMu.Lock()
+	if c.marketCancel != nil {
+		c.wsMu.Unlock()
+		return
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	c.marketCancel = cancel
+	c.wsMu.Unlock()
+
+	go c.runMarketStream(streamCtx, symbols)
+}
+
+func (c *AlpacaClient) StartTradingStream(ctx context.Context, onUpdate func(TradeUpdateEnvelope)) {
+	c.wsMu.Lock()
+	if c.tradingCancel != nil {
+		c.wsMu.Unlock()
+		return
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	c.tradingCancel = cancel
+	c.wsMu.Unlock()
+
+	go c.runTradingStream(streamCtx, onUpdate)
+}
+
+type marketMessage struct {
+	T  string  `json:"T"`
+	S  string  `json:"S"`
+	AP float64 `json:"ap"`
+	BP float64 `json:"bp"`
+	P  float64 `json:"p"`
+	C  float64 `json:"c"`
+}
+
+func (c *AlpacaClient) runMarketStream(ctx context.Context, symbols []string) {
+	backoff := 2 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.marketStreamURL(), nil)
+		if err != nil {
+			time.Sleep(backoff)
+			if backoff < 15*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = 2 * time.Second
+
+		if err := conn.WriteJSON(map[string]any{
+			"action": "auth",
+			"key":    c.apiKey,
+			"secret": c.secret,
+		}); err != nil {
+			conn.Close()
+			time.Sleep(backoff)
+			continue
+		}
+
+		sub := map[string]any{"action": "subscribe"}
+		if len(symbols) > 0 {
+			subs := make([]string, 0, len(symbols))
+			seen := map[string]struct{}{}
+			for _, s := range symbols {
+				s = strings.ToUpper(strings.TrimSpace(s))
+				if s == "" {
+					continue
+				}
+				if _, ok := seen[s]; ok {
+					continue
+				}
+				seen[s] = struct{}{}
+				subs = append(subs, s)
+			}
+			sub["quotes"] = subs
+			sub["trades"] = subs
+			sub["bars"] = subs
+		}
+		if err := conn.WriteJSON(sub); err != nil {
+			conn.Close()
+			time.Sleep(backoff)
+			continue
+		}
+
+		readErr := c.readMarketLoop(ctx, conn)
+		conn.Close()
+		if ctx.Err() != nil {
+			return
+		}
+		if readErr != nil {
+			time.Sleep(backoff)
+		}
+	}
+}
+
+func (c *AlpacaClient) readMarketLoop(ctx context.Context, conn *websocket.Conn) error {
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		var batch []marketMessage
+		if err := json.Unmarshal(msg, &batch); err != nil {
+			continue
+		}
+		for _, ev := range batch {
+			symbol := strings.ToUpper(strings.TrimSpace(ev.S))
+			switch ev.T {
+			case "q":
+				if ev.AP > 0 && ev.BP > 0 {
+					c.CachePrice(symbol, (ev.AP+ev.BP)/2.0)
+				}
+			case "t":
+				if ev.P > 0 {
+					c.CachePrice(symbol, ev.P)
+				}
+			case "b":
+				if ev.C > 0 {
+					c.CachePrice(symbol, ev.C)
+				}
+			}
+		}
+	}
+}
+
+type TradeUpdateEnvelope struct {
+	Stream string          `json:"stream"`
+	Data   TradeUpdateData `json:"data"`
+}
+
+type TradeUpdateData struct {
+	Event       string    `json:"event"`
+	Timestamp   time.Time `json:"timestamp"`
+	Price       string    `json:"price"`
+	Qty         string    `json:"qty"`
+	PositionQty string    `json:"position_qty"`
+	Order       Order     `json:"order"`
+}
+
+func (c *AlpacaClient) runTradingStream(ctx context.Context, onUpdate func(TradeUpdateEnvelope)) {
+	backoff := 2 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.tradingStreamURL(), nil)
+		if err != nil {
+			time.Sleep(backoff)
+			if backoff < 15*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = 2 * time.Second
+
+		if err := conn.WriteJSON(map[string]any{
+			"action": "auth",
+			"key":    c.apiKey,
+			"secret": c.secret,
+		}); err != nil {
+			conn.Close()
+			time.Sleep(backoff)
+			continue
+		}
+		if err := conn.WriteJSON(map[string]any{
+			"action": "listen",
+			"data": map[string]any{
+				"streams": []string{"trade_updates"},
+			},
+		}); err != nil {
+			conn.Close()
+			time.Sleep(backoff)
+			continue
+		}
+
+		readErr := c.readTradingLoop(ctx, conn, onUpdate)
+		conn.Close()
+		if ctx.Err() != nil {
+			return
+		}
+		if readErr != nil {
+			time.Sleep(backoff)
+		}
+	}
+}
+
+func (c *AlpacaClient) readTradingLoop(ctx context.Context, conn *websocket.Conn, onUpdate func(TradeUpdateEnvelope)) error {
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+
+		var env TradeUpdateEnvelope
+		if err := json.Unmarshal(msg, &env); err != nil {
+			continue
+		}
+		if env.Stream != "trade_updates" {
+			continue
+		}
+		if onUpdate != nil {
+			onUpdate(env)
+		}
+	}
+}
+
+func (b *Bot) startWebSockets(ctx context.Context) {
+	symbolSet := map[string]struct{}{}
+	b.mu.RLock()
+	for _, s := range b.strategies {
+		symbolSet[s.Symbol()] = struct{}{}
+	}
+	b.mu.RUnlock()
+
+	symbols := make([]string, 0, len(symbolSet))
+	for sym := range symbolSet {
+		symbols = append(symbols, sym)
+	}
+
+	b.client.AttachPriceCache(NewPriceCache())
+	b.client.StartMarketDataStream(ctx, symbols)
+	b.client.StartTradingStream(ctx, b.handleTradeUpdate)
+}
+
+func (b *Bot) handleTradeUpdate(update TradeUpdateEnvelope) {
+	data := update.Data
+	event := strings.ToLower(strings.TrimSpace(data.Event))
+	if event != "fill" && event != "partial_fill" {
+		return
+	}
+
+	symbol := strings.TrimSpace(data.Order.Symbol)
+	if symbol == "" {
+		return
+	}
+	side := strings.TrimSpace(data.Order.Side)
+	price := parseFloatString(data.Price)
+	if price <= 0 {
+		price = parseFloatString(data.Order.FilledAvgPrice)
+	}
+	filledQty := parseFloatString(data.Order.FilledQty)
+	eventQty := parseFloatString(data.Qty)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	prevFilled := b.seenFillQty[data.Order.ID]
+	delta := eventQty
+	if delta <= 0 {
+		delta = filledQty - prevFilled
+	}
+	if delta <= 0 {
+		return
+	}
+	if filledQty > prevFilled {
+		b.seenFillQty[data.Order.ID] = filledQty
+	} else {
+		b.seenFillQty[data.Order.ID] = prevFilled + delta
+	}
+
+	fillTime := data.Timestamp
+	if fillTime.IsZero() {
+		if data.Order.FilledAt != nil {
+			fillTime = *data.Order.FilledAt
+		} else {
+			fillTime = time.Now().UTC()
+		}
+	}
+
+	stratName := detectStrategyName(data.Order.ClientOrderID)
+	b.tradeRecords = append(b.tradeRecords, TradeRecord{
+		Time:          fillTime,
+		Symbol:        symbol,
+		Side:          side,
+		Qty:           delta,
+		Price:         price,
+		OrderID:       data.Order.ID,
+		ClientOrderID: data.Order.ClientOrderID,
+		Strategy:      stratName,
+	})
+	b.applyGlobalFill(symbol, side, delta, price)
+	b.applyStrategyFill(stratName, symbol, side, delta, price)
+	if price > 0 {
+		b.lastPrices[symbol] = price
+	}
+	b.recalcStrategyStatsLocked()
+}
+
+func (b *Bot) startReconcileLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := b.syncOrderFills(ctx); err != nil {
+				b.logError("system", "order reconcile failed: "+err.Error())
+			}
+		}
 	}
 }
 
@@ -1659,6 +2081,25 @@ func (b *Bot) Start(ctx context.Context) error {
 	b.stopFunc = cancel
 	b.isRunning = true
 	b.mu.Unlock()
+
+	// 先做一次 REST 回填，补上 WS 之前的成交和历史缺口
+	if err := b.syncOrderFills(runCtx); err != nil {
+		b.logError("system", "initial order backfill failed: "+err.Error())
+	}
+
+	if b.useWebSockets {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.startWebSockets(runCtx)
+		}()
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.startReconcileLoop(runCtx, 5*time.Minute)
+		}()
+	}
+
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
@@ -1684,6 +2125,7 @@ func (b *Bot) Stop() {
 		b.stopFunc()
 		b.stopFunc = nil
 	}
+	b.client.CloseStreams()
 	b.isRunning = false
 }
 
@@ -1727,7 +2169,7 @@ func (b *Bot) LiquidateAll(ctx context.Context) error {
 		case <-tick.C:
 			remaining, err := b.client.GetPositions(ctx)
 			if err == nil && len(remaining) == 0 {
-				log.Println("⚡ 仓位已成功归零，平仓完毕。")
+				log.Println(" 仓位已成功归零，平仓完毕。")
 				return nil
 			}
 			log.Println("正在等待仓位清空成交中...")

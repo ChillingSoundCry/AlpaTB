@@ -161,21 +161,19 @@ type StrategyDetail struct {
 
 func GetDashboard(w http.ResponseWriter, r *http.Request) {
 	logger.Info("enter GetDashboard")
-	fmt.Println("enter GetDashboard")
 
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 	msk := r.Header.Get("X-MSK")
-
 	if msk == "" {
 		http.Error(w, "Missing MSK", http.StatusUnauthorized)
 		return
-	} else if !globalCache.MskExists(msk) {
+	}
+	if !globalCache.MskExists(msk) {
 		http.Error(w, "MSK Expired", http.StatusUnauthorized)
 		return
 	}
-
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -209,7 +207,6 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取机器人运行状态
 	botRunning := bot.IsRunning()
 
 	assets, errAssets := bot.TotalAssets(ctx)
@@ -234,9 +231,7 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stats, errStats := bot.StrategySummaries(ctx)
-	if errStats == nil {
-		resp.Strategies = []StrategyDetail{}
-	} else {
+	if errStats != nil {
 		resp.Meta["strategies_error"] = errStats.Error()
 	}
 
@@ -698,10 +693,10 @@ func StartTrade() {
 	}))
 
 	bot.RegisterStrategy(process.NewOpenCloseStrategy(client, process.OpenCloseConfig{
-		Symbol:                 "MOD",
-		Qty:                    50,
-		BuyMinutesBeforeOpen:   5,
-		SellMinutesBeforeClose: 5,
+		Symbol:                "MOD",
+		Qty:                   50,
+		SellMinutesBeforeOpen: 0,
+		BuyMinutesBeforeClose: 0,
 	}))
 
 	ctx := context.Background()
