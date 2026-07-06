@@ -684,37 +684,45 @@ func StartTrade() {
 	bot := process.NewBot(client, cfg.Interval)
 
 	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
-		Symbol:      "LEU",
-		Levels:      6,
-		SpacingPct:  0.01,
-		QtyPerOrder: 5,
-		SeedQty:     20,
-		RecenterPct: 0.03,
+		Symbol:                "LEU",
+		Levels:                6,
+		SpacingPct:            0.02,
+		QtyPerOrder:           5,
+		SeedQty:               5,
+		RecenterPct:           0.05,
+		MaxPositionQty:        20,
+		UseTrendFilter:        true,
+		DailyBuyNotionalLimit: 1000,
+		BuyCooldown:           10 * time.Minute,
+		RebuildCooldown:       20 * time.Minute,
 	}))
 
 	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
-		Symbol:      "APLD",
-		Levels:      6,
-		SpacingPct:  0.01,
-		QtyPerOrder: 5,
-		SeedQty:     20,
-		RecenterPct: 0.03,
-	}))
-
-	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
-		Symbol:      "LITE",
-		Levels:      6,
-		SpacingPct:  0.01,
-		QtyPerOrder: 5,
-		SeedQty:     20,
-		RecenterPct: 0.03,
-	}))
-
-	bot.RegisterStrategy(process.NewOpenCloseStrategy(client, process.OpenCloseConfig{
 		Symbol:                "MOD",
-		Qty:                   50,
-		SellMinutesBeforeOpen: 0,
-		BuyMinutesBeforeClose: 0,
+		Levels:                6,
+		SpacingPct:            0.02,
+		QtyPerOrder:           5,
+		SeedQty:               5,
+		RecenterPct:           0.05,
+		MaxPositionQty:        20,
+		UseTrendFilter:        true,
+		DailyBuyNotionalLimit: 1000,
+		BuyCooldown:           10 * time.Minute,
+		RebuildCooldown:       20 * time.Minute,
+	}))
+
+	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
+		Symbol:                "IONQ",
+		Levels:                6,
+		SpacingPct:            0.02,
+		QtyPerOrder:           5,
+		SeedQty:               5,
+		RecenterPct:           0.05,
+		MaxPositionQty:        20,
+		UseTrendFilter:        true,
+		DailyBuyNotionalLimit: 1000,
+		BuyCooldown:           10 * time.Minute,
+		RebuildCooldown:       20 * time.Minute,
 	}))
 
 	ctx := context.Background()

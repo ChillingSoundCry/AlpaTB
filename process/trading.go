@@ -417,6 +417,9 @@ type BaseStrategy struct {
 // -----------------------
 // Grid Strategy
 // -----------------------
+// -----------------------
+// Grid Strategy
+// -----------------------
 
 type GridConfig struct {
 	Symbol         string
@@ -429,15 +432,26 @@ type GridConfig struct {
 	RecenterPct    float64
 	MaxPositionQty float64 // 最大仓位限制
 	UseTrendFilter bool    // 网格趋势过滤开关
+
+	DailyBuyNotionalLimit float64       // 每日最大买入金额，例如 1000
+	BuyCooldown           time.Duration // 每次买入后冷却，例如 5 * time.Minute
+	RebuildCooldown       time.Duration // 重建网格冷却，例如 15 * time.Minute
 }
 
 type GridStrategy struct {
 	BaseStrategy
-	cfg            GridConfig
-	initialized    bool
-	centerPrice    float64
-	lastBuildAt    time.Time
-	pendingOrders  map[string]time.Time
+	cfg           GridConfig
+	initialized   bool
+	centerPrice   float64
+	lastBuildAt   time.Time
+	lastBuyAt     time.Time
+	lastRebuildAt time.Time
+
+	pendingOrders map[string]time.Time
+
+	dailyBuyDate     string
+	dailyBuyNotional float64
+
 	ma20Mu         sync.Mutex
 	ma20CacheDay   string
 	ma20CacheAllow bool
@@ -454,8 +468,18 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 		cfg.QtyPerOrder = 1
 	}
 	if cfg.RecenterPct <= 0 {
-		cfg.RecenterPct = 0.05 // 网格动态重心默认调整为 5%
+		cfg.RecenterPct = 0.05
 	}
+	if cfg.BuyCooldown <= 0 {
+		cfg.BuyCooldown = 5 * time.Minute
+	}
+	if cfg.RebuildCooldown <= 0 {
+		cfg.RebuildCooldown = 15 * time.Minute
+	}
+	if cfg.DailyBuyNotionalLimit <= 0 {
+		cfg.DailyBuyNotionalLimit = 1000
+	}
+
 	return &GridStrategy{
 		BaseStrategy:  BaseStrategy{client: client},
 		cfg:           cfg,
@@ -466,13 +490,24 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 func (g *GridStrategy) Name() string {
 	return "grid-" + strings.ToUpper(strings.TrimSpace(g.cfg.Symbol))
 }
+
 func (g *GridStrategy) Symbol() string { return g.cfg.Symbol }
+
 func (g *GridStrategy) Config() map[string]interface{} {
 	return map[string]interface{}{
-		"symbol":        g.cfg.Symbol,
-		"levels":        g.cfg.Levels,
-		"spacing_pct":   g.cfg.SpacingPct,
-		"qty_per_order": g.cfg.QtyPerOrder,
+		"symbol":                   g.cfg.Symbol,
+		"levels":                   g.cfg.Levels,
+		"spacing_pct":              g.cfg.SpacingPct,
+		"qty_per_order":            g.cfg.QtyPerOrder,
+		"seed_qty":                 g.cfg.SeedQty,
+		"min_price":                g.cfg.MinPrice,
+		"max_price":                g.cfg.MaxPrice,
+		"recenter_pct":             g.cfg.RecenterPct,
+		"max_position_qty":         g.cfg.MaxPositionQty,
+		"use_trend_filter":         g.cfg.UseTrendFilter,
+		"daily_buy_notional_limit": g.cfg.DailyBuyNotionalLimit,
+		"buy_cooldown":             g.cfg.BuyCooldown.String(),
+		"rebuild_cooldown":         g.cfg.RebuildCooldown.String(),
 	}
 }
 
@@ -522,17 +557,21 @@ func (g *GridStrategy) checkTrendMA20(ctx context.Context) bool {
 func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	price, err := g.client.GetReferencePrice(ctx, g.cfg.Symbol)
 	if err != nil {
 		return err
 	}
+
 	openOrders, err := g.client.ListOrders(ctx, "open")
 	if err != nil {
 		return err
 	}
 	openOrders = filterOrdersBySymbol(openOrders, g.cfg.Symbol)
+
 	posQty, _ := currentPositionQty(ctx, g.client, g.cfg.Symbol)
 	buyingPower := parseFloatString(acct.BuyingPower)
+
 	pendingBuyQty := 0.0
 	for _, o := range openOrders {
 		if strings.ToLower(o.Side) == "buy" {
@@ -551,7 +590,6 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 			g.lastBuildAt = time.Now()
 			return nil
 		}
-		// 传递 pendingBuyQty 入内辅助仓位判定
 		return g.rebuildGrid(ctx, price, posQty, pendingBuyQty, buyingPower)
 	}
 
@@ -560,6 +598,13 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 		drift = math.Abs(price-g.centerPrice) / g.centerPrice
 	}
 	if drift >= g.cfg.RecenterPct {
+		now := time.Now()
+
+		// 防止价格在阈值附近抖动导致频繁撤单/重建
+		if g.cfg.RebuildCooldown > 0 && !g.lastRebuildAt.IsZero() && now.Sub(g.lastRebuildAt) < g.cfg.RebuildCooldown {
+			return nil
+		}
+
 		if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
 			return err
 		}
@@ -578,32 +623,63 @@ func (g *GridStrategy) cancelAllSymbolOrders(ctx context.Context, orders []Order
 	return nil
 }
 
+func (g *GridStrategy) resetDailyStatsIfNeeded(now time.Time) {
+	day := now.UTC().Format("2006-01-02")
+	if g.dailyBuyDate != day {
+		g.dailyBuyDate = day
+		g.dailyBuyNotional = 0
+	}
+}
+
+func (g *GridStrategy) canBuy(now time.Time, notional float64) bool {
+	g.resetDailyStatsIfNeeded(now)
+
+	if g.cfg.BuyCooldown > 0 && !g.lastBuyAt.IsZero() && now.Sub(g.lastBuyAt) < g.cfg.BuyCooldown {
+		return false
+	}
+	if g.cfg.DailyBuyNotionalLimit > 0 && g.dailyBuyNotional+notional > g.cfg.DailyBuyNotionalLimit {
+		return false
+	}
+	return true
+}
+
+func (g *GridStrategy) recordBuy(now time.Time, notional float64) {
+	g.resetDailyStatsIfNeeded(now)
+	g.lastBuyAt = now
+	g.dailyBuyNotional += notional
+}
+
 func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingBuyQty, buyingPower float64) error {
+	now := time.Now()
+
 	g.centerPrice = center
 	g.initialized = true
-	g.lastBuildAt = time.Now()
+	g.lastBuildAt = now
+	g.lastRebuildAt = now
 	g.pendingOrders = make(map[string]time.Time)
 
+	// 首次种子单
 	if posQty <= 0 && g.cfg.SeedQty > 0 {
 		notional := g.cfg.SeedQty * center
-		if buyingPower >= notional {
+		if buyingPower >= notional && g.canBuy(now, notional) {
 			_, err := g.client.PlaceOrder(ctx, OrderRequest{
 				Symbol:        g.cfg.Symbol,
 				Qty:           fmt.Sprintf("%.6f", g.cfg.SeedQty),
 				Side:          "buy",
 				Type:          "market",
 				TimeInForce:   "day",
-				ClientOrderID: fmt.Sprintf("grid-seed-%s-%d", g.cfg.Symbol, time.Now().UnixNano()),
+				ClientOrderID: fmt.Sprintf("grid-seed-%s-%d", g.cfg.Symbol, now.UnixNano()),
 			})
 			if err != nil {
 				return err
 			}
+			g.recordBuy(now, notional)
 			return nil
 		}
 		return nil
 	}
 
-	isUptrend := g.checkTrendMA20(ctx) // 趋势过滤检查
+	isUptrend := g.checkTrendMA20(ctx)
 	availableSellQty := posQty
 	usedBuyPrices := map[string]bool{}
 	usedSellPrices := map[string]bool{}
@@ -618,7 +694,8 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingB
 
 		if !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
 			projectedQty := posQty + pendingBuyQty + g.cfg.QtyPerOrder
-			if g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty {
+			notional := buyPrice * g.cfg.QtyPerOrder
+			if (g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty) && g.canBuy(now, notional) {
 				newBP := g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
 				if newBP < buyingPower {
 					buyingPower = newBP
@@ -641,6 +718,8 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingB
 }
 
 func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pendingBuyQty float64, openOrders []Order, buyingPower float64) error {
+	now := time.Now()
+
 	openBuyPrices := map[string]bool{}
 	openSellPrices := map[string]bool{}
 	openSellQty := 0.0
@@ -675,7 +754,8 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pending
 		sellKey := gridPriceKey(sellPrice)
 
 		if !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
-			if g.cfg.MaxPositionQty <= 0 || (posQty+pendingBuyQty+g.cfg.QtyPerOrder) <= g.cfg.MaxPositionQty {
+			notional := buyPrice * g.cfg.QtyPerOrder
+			if (g.cfg.MaxPositionQty <= 0 || (posQty+pendingBuyQty+g.cfg.QtyPerOrder) <= g.cfg.MaxPositionQty) && g.canBuy(now, notional) {
 				newBP := g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
 				if newBP < buyingPower {
 					buyingPower = newBP
@@ -698,15 +778,22 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pending
 }
 
 func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty, bp float64) float64 {
+	now := time.Now()
+
 	priceKey := gridPriceKey(price)
 	key := "buy-" + priceKey
 	if g.isPending(key) {
 		return bp
 	}
+
 	notional := price * qty
 	if bp < notional {
 		return bp
 	}
+	if !g.canBuy(now, notional) {
+		return bp
+	}
+
 	_, err := g.client.PlaceOrder(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
@@ -714,21 +801,25 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 		Type:          "limit",
 		TimeInForce:   "day",
 		LimitPrice:    priceKey,
-		ClientOrderID: fmt.Sprintf("grid-buy-%s-%d-%s-%d", g.cfg.Symbol, level, priceKey, time.Now().UnixNano()),
+		ClientOrderID: fmt.Sprintf("grid-buy-%s-%d-%s-%d", g.cfg.Symbol, level, priceKey, now.UnixNano()),
 	})
 	if err == nil {
-		g.pendingOrders[key] = time.Now()
+		g.pendingOrders[key] = now
+		g.recordBuy(now, notional)
 		return bp - notional
 	}
 	return bp
 }
 
 func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qty float64) {
+	now := time.Now()
+
 	priceKey := gridPriceKey(price)
 	key := "sell-" + priceKey
 	if g.isPending(key) {
 		return
 	}
+
 	_, err := g.client.PlaceOrder(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
@@ -736,10 +827,10 @@ func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qt
 		Type:          "limit",
 		TimeInForce:   "day",
 		LimitPrice:    priceKey,
-		ClientOrderID: fmt.Sprintf("grid-sell-%s-%d-%s-%d", g.cfg.Symbol, level, priceKey, time.Now().UnixNano()),
+		ClientOrderID: fmt.Sprintf("grid-sell-%s-%d-%s-%d", g.cfg.Symbol, level, priceKey, now.UnixNano()),
 	})
 	if err == nil {
-		g.pendingOrders[key] = time.Now()
+		g.pendingOrders[key] = now
 	}
 }
 

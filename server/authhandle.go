@@ -72,6 +72,7 @@ func AuthVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := GetClientIP(r)
+	fmt.Println("login ip is ", ip)
 	if globalCache.IsIPBlocked(ip) {
 
 		w.WriteHeader(http.StatusForbidden)
