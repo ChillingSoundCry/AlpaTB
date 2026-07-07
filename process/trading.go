@@ -422,16 +422,26 @@ type BaseStrategy struct {
 // -----------------------
 
 type GridConfig struct {
-	Symbol         string
-	Levels         int
-	SpacingPct     float64
-	QtyPerOrder    float64
-	SeedQty        float64
-	MinPrice       float64
-	MaxPrice       float64
-	RecenterPct    float64
-	MaxPositionQty float64 // 最大仓位限制
-	UseTrendFilter bool    // 网格趋势过滤开关
+	Symbol             string
+	Levels             int
+	SpacingPct         float64
+	MinSpacingPct      float64
+	MaxSpacingPct      float64
+	QtyPerOrder        float64
+	SeedQty            float64
+	MinPrice           float64
+	MaxPrice           float64
+	RecenterPct        float64
+	MaxPositionQty     float64 // 最大仓位限制
+	UseTrendFilter     bool    // 网格趋势过滤开关
+	ATRPeriod          int
+	ATRMultiplier      float64
+	CenterMode         string
+	CenterEMAPeriod    int
+	CenterVWAPLookback int
+	ADXPeriod          int
+	ADXTrendThreshold  float64
+	ADXRangeThreshold  float64
 
 	DailyBuyNotionalLimit float64       // 每日最大买入金额，例如 1000
 	BuyCooldown           time.Duration // 每次买入后冷却，例如 5 * time.Minute
@@ -440,12 +450,13 @@ type GridConfig struct {
 
 type GridStrategy struct {
 	BaseStrategy
-	cfg           GridConfig
-	initialized   bool
-	centerPrice   float64
-	lastBuildAt   time.Time
-	lastBuyAt     time.Time
-	lastRebuildAt time.Time
+	cfg            GridConfig
+	initialized    bool
+	centerPrice    float64
+	currentSpacing float64
+	lastBuildAt    time.Time
+	lastBuyAt      time.Time
+	lastRebuildAt  time.Time
 
 	pendingOrders map[string]time.Time
 
@@ -455,6 +466,14 @@ type GridStrategy struct {
 	ma20Mu         sync.Mutex
 	ma20CacheDay   string
 	ma20CacheAllow bool
+
+	indicatorMu        sync.Mutex
+	indicatorExpiresAt time.Time
+	cachedATR          float64
+	cachedEMA          float64
+	cachedVWAP         float64
+	cachedADX          float64
+	adxMode            string
 }
 
 func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
@@ -479,11 +498,43 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	if cfg.DailyBuyNotionalLimit <= 0 {
 		cfg.DailyBuyNotionalLimit = 1000
 	}
+	if cfg.MinSpacingPct < 0 {
+		cfg.MinSpacingPct = 0
+	}
+	if cfg.MaxSpacingPct > 0 && cfg.MaxSpacingPct < cfg.MinSpacingPct {
+		cfg.MaxSpacingPct = 0
+	}
+	if cfg.ATRPeriod <= 0 {
+		cfg.ATRPeriod = 14
+	}
+	if cfg.ATRMultiplier <= 0 {
+		cfg.ATRMultiplier = 1.0
+	}
+	cfg.CenterMode = strings.ToLower(strings.TrimSpace(cfg.CenterMode))
+	if cfg.CenterMode == "" {
+		cfg.CenterMode = "price"
+	}
+	if cfg.CenterEMAPeriod <= 0 {
+		cfg.CenterEMAPeriod = 20
+	}
+	if cfg.CenterVWAPLookback <= 0 {
+		cfg.CenterVWAPLookback = 30
+	}
+	if cfg.ADXPeriod <= 0 {
+		cfg.ADXPeriod = 14
+	}
+	if cfg.ADXTrendThreshold <= 0 {
+		cfg.ADXTrendThreshold = 25
+	}
+	if cfg.ADXRangeThreshold <= 0 || cfg.ADXRangeThreshold >= cfg.ADXTrendThreshold {
+		cfg.ADXRangeThreshold = cfg.ADXTrendThreshold * 0.8
+	}
 
 	return &GridStrategy{
-		BaseStrategy:  BaseStrategy{client: client},
-		cfg:           cfg,
-		pendingOrders: make(map[string]time.Time),
+		BaseStrategy:   BaseStrategy{client: client},
+		cfg:            cfg,
+		currentSpacing: cfg.SpacingPct,
+		pendingOrders:  make(map[string]time.Time),
 	}
 }
 
@@ -498,6 +549,8 @@ func (g *GridStrategy) Config() map[string]interface{} {
 		"symbol":                   g.cfg.Symbol,
 		"levels":                   g.cfg.Levels,
 		"spacing_pct":              g.cfg.SpacingPct,
+		"min_spacing_pct":          g.cfg.MinSpacingPct,
+		"max_spacing_pct":          g.cfg.MaxSpacingPct,
 		"qty_per_order":            g.cfg.QtyPerOrder,
 		"seed_qty":                 g.cfg.SeedQty,
 		"min_price":                g.cfg.MinPrice,
@@ -505,6 +558,14 @@ func (g *GridStrategy) Config() map[string]interface{} {
 		"recenter_pct":             g.cfg.RecenterPct,
 		"max_position_qty":         g.cfg.MaxPositionQty,
 		"use_trend_filter":         g.cfg.UseTrendFilter,
+		"atr_period":               g.cfg.ATRPeriod,
+		"atr_multiplier":           g.cfg.ATRMultiplier,
+		"center_mode":              g.cfg.CenterMode,
+		"center_ema_period":        g.cfg.CenterEMAPeriod,
+		"center_vwap_lookback":     g.cfg.CenterVWAPLookback,
+		"adx_period":               g.cfg.ADXPeriod,
+		"adx_trend_threshold":      g.cfg.ADXTrendThreshold,
+		"adx_range_threshold":      g.cfg.ADXRangeThreshold,
 		"daily_buy_notional_limit": g.cfg.DailyBuyNotionalLimit,
 		"buy_cooldown":             g.cfg.BuyCooldown.String(),
 		"rebuild_cooldown":         g.cfg.RebuildCooldown.String(),
@@ -583,35 +644,83 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 		}
 	}
 
+	if err := g.refreshIndicatorSnapshot(ctx); err != nil {
+		log.Printf("grid %s indicator refresh failed: %v", g.cfg.Symbol, err)
+	}
+
+	spacing := g.calculateSpacing(price)
+	g.currentSpacing = spacing
+
+	targetCenter := g.determineCenter(price)
+	if targetCenter <= 0 {
+		targetCenter = price
+	}
+
+	g.updateADXMode()
+
 	if !g.initialized {
 		if len(openOrders) > 0 {
-			g.centerPrice = price
+			if g.centerPrice <= 0 {
+				g.centerPrice = targetCenter
+			}
+			if g.centerPrice <= 0 {
+				g.centerPrice = price
+			}
+			g.currentSpacing = spacing
 			g.initialized = true
 			g.lastBuildAt = time.Now()
 			return nil
 		}
-		return g.rebuildGrid(ctx, price, posQty, pendingBuyQty, buyingPower)
+		if spacing <= 0 {
+			spacing = g.cfg.SpacingPct
+		}
+		if spacing <= 0 {
+			spacing = 0.01
+		}
+		if targetCenter <= 0 {
+			targetCenter = price
+		}
+		g.currentSpacing = spacing
+		return g.rebuildGrid(ctx, targetCenter, spacing, posQty, pendingBuyQty, buyingPower)
+	}
+
+	centerUsed := g.centerPrice
+	if centerUsed <= 0 {
+		centerUsed = targetCenter
+	}
+	if centerUsed <= 0 {
+		centerUsed = price
 	}
 
 	drift := 0.0
-	if g.centerPrice > 0 {
-		drift = math.Abs(price-g.centerPrice) / g.centerPrice
+	if centerUsed > 0 {
+		drift = math.Abs(price-centerUsed) / centerUsed
 	}
-	if drift >= g.cfg.RecenterPct {
-		now := time.Now()
+	centerDrift := 0.0
+	if targetCenter > 0 && centerUsed > 0 {
+		centerDrift = math.Abs(targetCenter-centerUsed) / centerUsed
+	}
 
-		// 防止价格在阈值附近抖动导致频繁撤单/重建
+	if drift >= g.cfg.RecenterPct || centerDrift >= g.cfg.RecenterPct {
+		now := time.Now()
 		if g.cfg.RebuildCooldown > 0 && !g.lastRebuildAt.IsZero() && now.Sub(g.lastRebuildAt) < g.cfg.RebuildCooldown {
 			return nil
 		}
-
 		if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
 			return err
 		}
-		return g.rebuildGrid(ctx, price, posQty, 0.0, buyingPower)
+		return g.rebuildGrid(ctx, targetCenter, spacing, posQty, 0.0, buyingPower)
 	}
 
-	return g.maintainGrid(ctx, price, posQty, pendingBuyQty, openOrders, buyingPower)
+	if centerUsed > 0 && targetCenter > 0 && g.cfg.RecenterPct > 0 {
+		diff := math.Abs(targetCenter-centerUsed) / centerUsed
+		if diff > 0 && diff < g.cfg.RecenterPct/2 {
+			centerUsed = targetCenter
+		}
+	}
+
+	g.centerPrice = centerUsed
+	return g.maintainGrid(ctx, centerUsed, spacing, posQty, pendingBuyQty, openOrders, buyingPower)
 }
 
 func (g *GridStrategy) cancelAllSymbolOrders(ctx context.Context, orders []Order) error {
@@ -649,17 +758,28 @@ func (g *GridStrategy) recordBuy(now time.Time, notional float64) {
 	g.dailyBuyNotional += notional
 }
 
-func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingBuyQty, buyingPower float64) error {
+func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing, posQty, pendingBuyQty, buyingPower float64) error {
 	now := time.Now()
 
+	if spacing <= 0 {
+		spacing = g.cfg.SpacingPct
+	}
+	if spacing <= 0 {
+		spacing = 0.01
+	}
+
 	g.centerPrice = center
+	g.currentSpacing = spacing
 	g.initialized = true
 	g.lastBuildAt = now
 	g.lastRebuildAt = now
 	g.pendingOrders = make(map[string]time.Time)
 
+	isUptrend := g.checkTrendMA20(ctx)
+	allowBuys := isUptrend && g.allowGridBuys()
+
 	// 首次种子单
-	if posQty <= 0 && g.cfg.SeedQty > 0 {
+	if posQty <= 0 && g.cfg.SeedQty > 0 && allowBuys {
 		notional := g.cfg.SeedQty * center
 		if buyingPower >= notional && g.canBuy(now, notional) {
 			_, err := g.client.PlaceOrder(ctx, OrderRequest{
@@ -676,23 +796,24 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingB
 			g.recordBuy(now, notional)
 			return nil
 		}
-		return nil
 	}
 
-	isUptrend := g.checkTrendMA20(ctx)
 	availableSellQty := posQty
 	usedBuyPrices := map[string]bool{}
 	usedSellPrices := map[string]bool{}
 
 	for i := 1; i <= g.cfg.Levels; i++ {
-		off := float64(i) * g.cfg.SpacingPct
+		if spacing <= 0 {
+			break
+		}
+		off := float64(i) * spacing
 		buyPrice := center * (1 - off)
 		sellPrice := center * (1 + off)
 
 		buyKey := gridPriceKey(buyPrice)
 		sellKey := gridPriceKey(sellPrice)
 
-		if !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
+		if allowBuys && !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
 			projectedQty := posQty + pendingBuyQty + g.cfg.QtyPerOrder
 			notional := buyPrice * g.cfg.QtyPerOrder
 			if (g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty) && g.canBuy(now, notional) {
@@ -717,8 +838,17 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, posQty, pendingB
 	return nil
 }
 
-func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pendingBuyQty float64, openOrders []Order, buyingPower float64) error {
+func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing, posQty, pendingBuyQty float64, openOrders []Order, buyingPower float64) error {
 	now := time.Now()
+
+	if spacing <= 0 {
+		spacing = g.cfg.SpacingPct
+	}
+	if spacing <= 0 {
+		spacing = 0.01
+	}
+
+	g.currentSpacing = spacing
 
 	openBuyPrices := map[string]bool{}
 	openSellPrices := map[string]bool{}
@@ -741,19 +871,23 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, posQty, pending
 	}
 
 	isUptrend := g.checkTrendMA20(ctx)
+	allowBuys := isUptrend && g.allowGridBuys()
 	availableSellQty := math.Max(0, posQty-openSellQty)
 	usedBuyPrices := map[string]bool{}
 	usedSellPrices := map[string]bool{}
 
 	for i := 1; i <= g.cfg.Levels; i++ {
-		off := float64(i) * g.cfg.SpacingPct
+		if spacing <= 0 {
+			break
+		}
+		off := float64(i) * spacing
 		buyPrice := center * (1 - off)
 		sellPrice := center * (1 + off)
 
 		buyKey := gridPriceKey(buyPrice)
 		sellKey := gridPriceKey(sellPrice)
 
-		if !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) && isUptrend {
+		if allowBuys && !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
 			notional := buyPrice * g.cfg.QtyPerOrder
 			if (g.cfg.MaxPositionQty <= 0 || (posQty+pendingBuyQty+g.cfg.QtyPerOrder) <= g.cfg.MaxPositionQty) && g.canBuy(now, notional) {
 				newBP := g.placeBuyIfSafe(ctx, i, buyPrice, g.cfg.QtyPerOrder, buyingPower)
@@ -845,16 +979,316 @@ func (g *GridStrategy) isPending(key string) bool {
 }
 
 func (g *GridStrategy) levelIndex(center, price float64) int {
-	if center <= 0 || price <= 0 || g.cfg.SpacingPct <= 0 {
+	spacing := g.currentSpacing
+	if spacing <= 0 {
+		spacing = g.cfg.SpacingPct
+	}
+	if center <= 0 || price <= 0 || spacing <= 0 {
 		return 0
 	}
 	ratio := price / center
 	diff := math.Abs(1 - ratio)
-	idx := int(math.Round(diff / g.cfg.SpacingPct))
+	idx := int(math.Round(diff / spacing))
 	if idx < 1 {
 		idx = 1
 	}
 	return idx
+}
+
+func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
+	needsATR := g.cfg.ATRPeriod > 0 && g.cfg.ATRMultiplier > 0
+	needsEMA := strings.EqualFold(g.cfg.CenterMode, "ema")
+	needsVWAP := strings.EqualFold(g.cfg.CenterMode, "vwap")
+	needsADX := g.cfg.ADXPeriod > 0 && (g.cfg.ADXTrendThreshold > 0 || g.cfg.ADXRangeThreshold > 0)
+
+	if !needsATR && !needsEMA && !needsVWAP && !needsADX {
+		return nil
+	}
+
+	now := time.Now()
+	g.indicatorMu.Lock()
+	if !g.indicatorExpiresAt.IsZero() && now.Before(g.indicatorExpiresAt) {
+		g.indicatorMu.Unlock()
+		return nil
+	}
+	g.indicatorMu.Unlock()
+
+	end := time.Now().UTC()
+	start := end.AddDate(0, 0, -30)
+
+	bars, err := g.client.GetBars(ctx, g.cfg.Symbol, "1Hour", start, end, 1000)
+	if err != nil {
+		g.indicatorMu.Lock()
+		g.indicatorExpiresAt = time.Now().Add(time.Minute)
+		g.indicatorMu.Unlock()
+		return err
+	}
+	if len(bars) < 2 {
+		g.indicatorMu.Lock()
+		g.indicatorExpiresAt = time.Now().Add(time.Minute)
+		g.indicatorMu.Unlock()
+		return errors.New("insufficient bars for indicators")
+	}
+
+	var atr, ema, vwap, adx float64
+	if needsATR {
+		atr = computeATR(bars, g.cfg.ATRPeriod)
+	}
+	if needsEMA {
+		ema = computeEMA(bars, g.cfg.CenterEMAPeriod)
+	}
+	if needsVWAP {
+		vwap = computeVWAP(bars, g.cfg.CenterVWAPLookback)
+	}
+	if needsADX {
+		adx = computeADX(bars, g.cfg.ADXPeriod)
+	}
+
+	g.indicatorMu.Lock()
+	if needsATR {
+		g.cachedATR = atr
+	}
+	if needsEMA {
+		g.cachedEMA = ema
+	}
+	if needsVWAP {
+		g.cachedVWAP = vwap
+	}
+	if needsADX {
+		g.cachedADX = adx
+	}
+	g.indicatorExpiresAt = time.Now().Add(5 * time.Minute)
+	g.indicatorMu.Unlock()
+	return nil
+}
+
+func (g *GridStrategy) calculateSpacing(price float64) float64 {
+	spacing := g.cfg.SpacingPct
+	g.indicatorMu.Lock()
+	atr := g.cachedATR
+	g.indicatorMu.Unlock()
+
+	if price > 0 && atr > 0 && g.cfg.ATRMultiplier > 0 {
+		spacing = (atr / price) * g.cfg.ATRMultiplier
+		if g.cfg.MinSpacingPct > 0 && spacing < g.cfg.MinSpacingPct {
+			spacing = g.cfg.MinSpacingPct
+		}
+		if g.cfg.MaxSpacingPct > 0 && spacing > g.cfg.MaxSpacingPct {
+			spacing = g.cfg.MaxSpacingPct
+		}
+	}
+	if spacing <= 0 {
+		spacing = g.cfg.SpacingPct
+	}
+	if spacing <= 0 {
+		spacing = 0.01
+	}
+	return spacing
+}
+
+func (g *GridStrategy) determineCenter(fallback float64) float64 {
+	mode := strings.ToLower(strings.TrimSpace(g.cfg.CenterMode))
+
+	g.indicatorMu.Lock()
+	ema := g.cachedEMA
+	vwap := g.cachedVWAP
+	g.indicatorMu.Unlock()
+
+	switch mode {
+	case "ema":
+		if ema > 0 {
+			return ema
+		}
+	case "vwap":
+		if vwap > 0 {
+			return vwap
+		}
+	}
+	if g.centerPrice > 0 {
+		return g.centerPrice
+	}
+	return fallback
+}
+
+func (g *GridStrategy) updateADXMode() string {
+	if g.cfg.ADXPeriod <= 0 || (g.cfg.ADXTrendThreshold <= 0 && g.cfg.ADXRangeThreshold <= 0) {
+		g.adxMode = "range"
+		return g.adxMode
+	}
+
+	g.indicatorMu.Lock()
+	value := g.cachedADX
+	g.indicatorMu.Unlock()
+
+	trendThreshold := g.cfg.ADXTrendThreshold
+	rangeThreshold := g.cfg.ADXRangeThreshold
+	if rangeThreshold <= 0 || rangeThreshold >= trendThreshold {
+		rangeThreshold = trendThreshold * 0.8
+	}
+
+	mode := g.adxMode
+	if mode == "" {
+		if value >= trendThreshold && trendThreshold > 0 {
+			mode = "trend"
+		} else {
+			mode = "range"
+		}
+	} else {
+		if mode == "trend" && rangeThreshold > 0 && value <= rangeThreshold {
+			mode = "range"
+		} else if mode == "range" && trendThreshold > 0 && value >= trendThreshold {
+			mode = "trend"
+		}
+	}
+	g.adxMode = mode
+	return mode
+}
+
+func (g *GridStrategy) allowGridBuys() bool {
+	if g.cfg.ADXPeriod <= 0 || (g.cfg.ADXTrendThreshold <= 0 && g.cfg.ADXRangeThreshold <= 0) {
+		return true
+	}
+	return g.adxMode != "trend"
+}
+
+func trueRange(current, previous Bar) float64 {
+	hl := current.High - current.Low
+	hp := math.Abs(current.High - previous.Close)
+	lp := math.Abs(current.Low - previous.Close)
+
+	tr := hl
+	if hp > tr {
+		tr = hp
+	}
+	if lp > tr {
+		tr = lp
+	}
+	if tr < 0 {
+		return 0
+	}
+	return tr
+}
+
+func computeATR(bars []Bar, period int) float64 {
+	if period <= 0 || len(bars) < period+1 {
+		return 0
+	}
+	start := len(bars) - period
+	if start < 1 {
+		start = 1
+	}
+	sum := 0.0
+	for i := start; i < len(bars); i++ {
+		sum += trueRange(bars[i], bars[i-1])
+	}
+	return sum / float64(len(bars)-start)
+}
+
+func computeEMA(bars []Bar, period int) float64 {
+	if period <= 0 || len(bars) == 0 {
+		return 0
+	}
+	k := 2.0 / (float64(period) + 1)
+	ema := bars[0].Close
+	for i := 1; i < len(bars); i++ {
+		ema = (bars[i].Close-ema)*k + ema
+	}
+	return ema
+}
+
+func computeVWAP(bars []Bar, lookback int) float64 {
+	if len(bars) == 0 {
+		return 0
+	}
+	if lookback <= 0 || lookback > len(bars) {
+		lookback = len(bars)
+	}
+	start := len(bars) - lookback
+	pv := 0.0
+	vol := 0.0
+	for i := start; i < len(bars); i++ {
+		typical := (bars[i].High + bars[i].Low + bars[i].Close) / 3.0
+		pv += typical * bars[i].Volume
+		vol += bars[i].Volume
+	}
+	if vol == 0 {
+		return 0
+	}
+	return pv / vol
+}
+
+func computeADX(bars []Bar, period int) float64 {
+	if period <= 0 || len(bars) < period+2 {
+		return 0
+	}
+
+	n := len(bars)
+	tr := make([]float64, n)
+	plusDM := make([]float64, n)
+	minusDM := make([]float64, n)
+
+	for i := 1; i < n; i++ {
+		highDiff := bars[i].High - bars[i-1].High
+		lowDiff := bars[i-1].Low - bars[i].Low
+
+		tr[i] = trueRange(bars[i], bars[i-1])
+		if highDiff > lowDiff && highDiff > 0 {
+			plusDM[i] = highDiff
+		}
+		if lowDiff > highDiff && lowDiff > 0 {
+			minusDM[i] = lowDiff
+		}
+	}
+
+	var tr14, plus14, minus14 float64
+	for i := 1; i <= period && i < n; i++ {
+		tr14 += tr[i]
+		plus14 += plusDM[i]
+		minus14 += minusDM[i]
+	}
+	if tr14 == 0 {
+		return 0
+	}
+
+	dxs := make([]float64, 0, n-period)
+	plusDI := 100 * (plus14 / tr14)
+	minusDI := 100 * (minus14 / tr14)
+	denom := plusDI + minusDI
+	if denom != 0 {
+		dxs = append(dxs, 100*math.Abs(plusDI-minusDI)/denom)
+	}
+
+	for i := period + 1; i < n; i++ {
+		tr14 = tr14 - (tr14 / float64(period)) + tr[i]
+		plus14 = plus14 - (plus14 / float64(period)) + plusDM[i]
+		minus14 = minus14 - (minus14 / float64(period)) + minusDM[i]
+
+		if tr14 == 0 {
+			continue
+		}
+		plusDI = 100 * (plus14 / tr14)
+		minusDI = 100 * (minus14 / tr14)
+		denom = plusDI + minusDI
+		if denom == 0 {
+			continue
+		}
+		dx := 100 * math.Abs(plusDI-minusDI) / denom
+		dxs = append(dxs, dx)
+	}
+
+	if len(dxs) == 0 {
+		return 0
+	}
+
+	window := period
+	if window > len(dxs) {
+		window = len(dxs)
+	}
+	sum := 0.0
+	for i := len(dxs) - window; i < len(dxs); i++ {
+		sum += dxs[i]
+	}
+	return sum / float64(window)
 }
 
 // -----------------------

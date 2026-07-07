@@ -676,6 +676,32 @@ func buildStrategyDetails(
 	return out
 }
 
+func defaultGridConfig(symbol string, qtyPerOrder, maxQty float64) process.GridConfig {
+	return process.GridConfig{
+		Symbol:                symbol,
+		Levels:                6,
+		SpacingPct:            0.02,
+		MinSpacingPct:         0.01,
+		MaxSpacingPct:         0.06,
+		QtyPerOrder:           qtyPerOrder,
+		SeedQty:               qtyPerOrder,
+		RecenterPct:           0.05,
+		MaxPositionQty:        maxQty,
+		UseTrendFilter:        true,
+		ATRPeriod:             14,
+		ATRMultiplier:         1.2,
+		CenterMode:            "ema",
+		CenterEMAPeriod:       34,
+		CenterVWAPLookback:    48,
+		ADXPeriod:             14,
+		ADXTrendThreshold:     25,
+		ADXRangeThreshold:     18,
+		DailyBuyNotionalLimit: 1000,
+		BuyCooldown:           10 * time.Minute,
+		RebuildCooldown:       20 * time.Minute,
+	}
+}
+
 // StartTrade 初始化并启动交易机器人，赋值给全局 globalBot。
 func StartTrade() {
 	cfg := process.LoadConfig()
@@ -683,47 +709,9 @@ func StartTrade() {
 	client := process.NewAlpacaClient(cfg)
 	bot := process.NewBot(client, cfg.Interval)
 
-	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
-		Symbol:                "LEU",
-		Levels:                6,
-		SpacingPct:            0.02,
-		QtyPerOrder:           5,
-		SeedQty:               5,
-		RecenterPct:           0.05,
-		MaxPositionQty:        20,
-		UseTrendFilter:        true,
-		DailyBuyNotionalLimit: 1000,
-		BuyCooldown:           10 * time.Minute,
-		RebuildCooldown:       20 * time.Minute,
-	}))
-
-	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
-		Symbol:                "MOD",
-		Levels:                6,
-		SpacingPct:            0.02,
-		QtyPerOrder:           5,
-		SeedQty:               5,
-		RecenterPct:           0.05,
-		MaxPositionQty:        20,
-		UseTrendFilter:        true,
-		DailyBuyNotionalLimit: 1000,
-		BuyCooldown:           10 * time.Minute,
-		RebuildCooldown:       20 * time.Minute,
-	}))
-
-	bot.RegisterStrategy(process.NewGridStrategy(client, process.GridConfig{
-		Symbol:                "IONQ",
-		Levels:                6,
-		SpacingPct:            0.02,
-		QtyPerOrder:           5,
-		SeedQty:               5,
-		RecenterPct:           0.05,
-		MaxPositionQty:        20,
-		UseTrendFilter:        true,
-		DailyBuyNotionalLimit: 1000,
-		BuyCooldown:           10 * time.Minute,
-		RebuildCooldown:       20 * time.Minute,
-	}))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("LEU", 5, 25)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("MOD", 5, 25)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("IONQ", 5, 25)))
 
 	ctx := context.Background()
 	if err := bot.Start(ctx); err != nil {

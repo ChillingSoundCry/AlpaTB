@@ -28,52 +28,185 @@
         };
     </script>
     <style>
+        :root {
+            --brand-primary: #4f46e5;
+            --brand-secondary: #7c3aed;
+            --brand-accent: #0ea5e9;
+            --brand-danger: #ef4444;
+            --text-primary: #0f172a;
+            --text-muted: #64748b;
+        }
         html, body {
             margin: 0;
             padding: 0;
             min-height: 100vh;
-            background: #f1f5f9;
-            background-attachment: fixed;
+            background: linear-gradient(140deg, #f9fbff 0%, #eef2ff 60%, #f8fafc 100%);
+            color: var(--text-primary);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif;
         }
         body::before {
             content: '';
             position: fixed;
             inset: 0;
-            z-index: 0;
             pointer-events: none;
             background:
-                radial-gradient(ellipse 80% 60% at 20% 15%, rgba(139,92,246,0.06) 0%, transparent 55%),
-                radial-gradient(ellipse 60% 50% at 75% 80%, rgba(6,182,212,0.05) 0%, transparent 55%);
-            background-attachment: fixed;
+                radial-gradient(55% 75% at 15% 20%, rgba(79, 70, 229, 0.12) 0%, transparent 65%),
+                radial-gradient(45% 65% at 80% 5%, rgba(59, 130, 246, 0.12) 0%, transparent 70%),
+                radial-gradient(45% 60% at 50% 85%, rgba(129, 140, 248, 0.1) 0%, transparent 70%);
         }
         #app { position: relative; z-index: 1; }
         [v-cloak] { display: none; }
-        .glass {
-            background: rgba(255,255,255,0.78);
-            backdrop-filter: blur(14px);
-            -webkit-backdrop-filter: blur(14px);
-            border: 1px solid rgba(255,255,255,0.55);
-            box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.03);
-        }
-        .card-hover { transition: all 0.22s; cursor: pointer; }
-        .card-hover:hover { transform: translateY(-3px); box-shadow: 0 14px 36px -12px rgba(124,58,237,0.18); }
-        .fade-in { animation: fadeSlideIn 0.28s; }
-        @keyframes fadeSlideIn {
-            from { opacity: 0; transform: translateY(16px) scale(0.98); }
-            to { opacity: 1; transform: translateY(0) scale(1); }
-        }
-        .scrollbar-thin::-webkit-scrollbar { width: 5px; }
-        .scrollbar-thin::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
 
-        /* Auth styles */
+        .glass {
+            position: relative;
+            border-radius: 22px;
+            background: rgba(255, 255, 255, 0.96);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            box-shadow: 0 18px 45px -30px rgba(15, 23, 42, 0.25);
+            overflow: hidden;
+        }
+        .glass::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(120deg, rgba(255, 255, 255, 0.66) 0%, transparent 70%);
+            pointer-events: none;
+            opacity: 0.75;
+        }
+        .glass > * { position: relative; z-index: 1; }
+
+        .panel {
+            transition: transform 0.25s ease, box-shadow 0.25s ease;
+        }
+        .panel:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 24px 50px -28px rgba(79, 70, 229, 0.28);
+        }
+        .hero-card {
+            background: linear-gradient(130deg, rgba(79, 70, 229, 0.08) 0%, rgba(59, 130, 246, 0.04) 45%, rgba(255, 255, 255, 0) 90%);
+        }
+        .panel--balanced {
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.98) 0%, rgba(248, 250, 252, 0.9) 100%);
+            border: 1px solid rgba(79, 70, 229, 0.12);
+        }
+
+        .metric-tile {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.96) 0%, rgba(255, 255, 255, 0.82) 100%);
+            border-radius: 18px;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            box-shadow: 0 16px 36px -28px rgba(15, 23, 42, 0.28);
+        }
+
+        .card-hover {
+            transition: transform 0.28s ease, box-shadow 0.28s ease;
+            cursor: pointer;
+        }
+        .card-hover:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 24px 54px -32px rgba(36, 99, 235, 0.24);
+        }
+
+        .main-nav {
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(14px);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+        }
+        .main-nav__inner { position: relative; }
+        .nav-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+        .nav-actions .btn { min-width: max-content; }
+
+        .runtime-indicator {
+            padding: 0.45rem 0.95rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            background: rgba(241, 245, 249, 0.85);
+            border: 1px solid rgba(148, 163, 184, 0.32);
+            color: var(--text-muted);
+        }
+        .runtime-indicator__pulse {
+            position: relative;
+            display: inline-flex;
+            width: 12px;
+            height: 12px;
+            justify-content: center;
+            align-items: center;
+            margin-right: 0.4rem;
+        }
+        .runtime-indicator__ping {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 999px;
+            animation: pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        .runtime-indicator__dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #94a3b8;
+        }
+        .runtime-indicator--online .runtime-indicator__ping { background: rgba(16, 185, 129, 0.45); }
+        .runtime-indicator--online .runtime-indicator__dot { background: #059669; }
+        .runtime-indicator__label { letter-spacing: 0.03em; text-transform: uppercase; }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.4rem;
+            padding: 0.55rem 1.2rem;
+            border-radius: 16px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            border: 1px solid transparent;
+            transition: transform 0.18s ease, box-shadow 0.22s ease;
+        }
+        .btn:disabled { cursor: not-allowed; opacity: 0.45; }
+        .btn--danger {
+            background: linear-gradient(135deg, #f87171 0%, #ef4444 60%, #ec4899 110%);
+            color: #fff;
+            box-shadow: 0 18px 32px -20px rgba(248, 113, 113, 0.45);
+        }
+        .btn--primary {
+            background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+            color: #fff;
+            box-shadow: 0 18px 32px -20px rgba(79, 70, 229, 0.45);
+        }
+        .btn--ghost {
+            background: #f8fafc;
+            border: 1px solid rgba(148, 163, 184, 0.4);
+            color: var(--text-primary);
+            box-shadow: 0 12px 24px -18px rgba(15, 23, 42, 0.18);
+        }
+        .btn:hover:not(:disabled) { transform: translateY(-2px); }
+
+        .fade-in { animation: fadeSlideIn 0.25s both; }
+        @keyframes fadeSlideIn {
+            from { opacity: 0; transform: translateY(14px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(0.9); opacity: 0.6; }
+            50% { transform: scale(1.4); opacity: 0; }
+        }
+
+        .scrollbar-thin::-webkit-scrollbar { width: 5px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.5); border-radius: 10px; }
+
         .auth-mask {
             position: fixed;
             inset: 0;
             z-index: 99999;
-            backdrop-filter: blur(18px);
-            -webkit-backdrop-filter: blur(18px);
-            background: rgba(15, 23, 42, .35);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            background: rgba(15, 23, 42, 0.12);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -82,20 +215,20 @@
         .auth-card {
             width: 420px;
             max-width: 100%;
-            background: rgba(255, 255, 255, .96);
-            border: 1px solid rgba(255, 255, 255, .65);
-            border-radius: 30px;
+            background: #ffffff;
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            border-radius: 24px;
             padding: 40px;
-            box-shadow: 0 30px 80px rgba(0, 0, 0, .18);
+            box-shadow: 0 26px 60px -30px rgba(15, 23, 42, 0.35);
         }
         .auth-card h2 {
             font-size: 24px;
             font-weight: 900;
-            color: #0f172a;
+            color: var(--text-primary);
             text-align: center;
         }
         .auth-card p {
-            color: #64748b;
+            color: var(--text-muted);
             font-size: 13px;
             text-align: center;
             margin-top: 8px;
@@ -104,38 +237,55 @@
             width: 100%;
             margin-top: 18px;
             padding: 14px 16px;
-            border: 1px solid #cbd5e1;
+            border: 1px solid rgba(148, 163, 184, 0.5);
             border-radius: 14px;
             outline: none;
-            font-size: 14px;
+            font-size: 15px;
+            background: #f8fafc;
+            color: var(--text-primary);
         }
         .auth-card input:focus {
-            border-color: var(--brand-primary, #7C3AED);
-            box-shadow: 0 0 0 3px rgba(139, 92, 246, .12);
+            border-color: rgba(79, 70, 229, 0.6);
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.16);
         }
         .auth-card button {
             width: 100%;
-            margin-top: 16px;
+            margin-top: 18px;
             padding: 14px 16px;
             border: none;
             border-radius: 14px;
-            background: #7C3AED;
+            background: linear-gradient(135deg, #4f46e5 0%, #0ea5e9 100%);
             color: #fff;
-            font-weight: 800;
+            font-weight: 700;
+            letter-spacing: 0.05em;
             cursor: pointer;
-            transition: opacity .2s, transform .05s, background-color .2s;
+            box-shadow: 0 18px 34px -24px rgba(14, 165, 233, 0.45);
         }
-        .auth-card button:hover { background: #6D28D9; }
-        .auth-card button:active { transform: translateY(1px); }
-        .auth-card button:disabled { opacity: .5; cursor: not-allowed; }
+        .auth-card button:disabled { opacity: 0.55; cursor: not-allowed; }
         .auth-error {
             margin-top: 14px;
-            color: #ef4444;
+            color: var(--brand-danger);
             font-size: 13px;
-            font-weight: 700;
+            font-weight: 600;
             text-align: center;
-            min-height: 18px;
         }
+
+        @media (max-width: 640px) {
+            .nav-actions { justify-content: center; }
+        }
+
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        thead tr { background: rgba(241, 245, 249, 0.95); }
+        thead th {
+            color: var(--text-muted);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-size: 11px;
+        }
+        th, td { padding: 0.65rem; }
     </style>
 </head>
 <body class="text-slate-800 antialiased">
@@ -158,35 +308,34 @@
             </div>
         </div>
 
-        <header class="sticky top-0 z-40 bg-white/82 backdrop-blur-lg border-b border-slate-200/50 shadow-sm">
+        <header class="main-nav sticky top-0 z-40">
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                <div class="h-16 flex items-center justify-between">
+                <div class="main-nav__inner h-16 flex items-center justify-between">
                     <div class="flex items-center gap-3">
                         <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-cyan-500 flex items-center justify-center text-white font-bold">LZ</div>
                         <div>
                             <div class="text-slate-900 font-bold">Lazrus</div>
-                            <div class="text-slate-500 text-[10px] uppercase">Quant Strategy Center</div>
+                            <div class="text-slate-500 text-[10px] uppercase tracking-[0.2em]">Quant Strategy Center</div>
                         </div>
                     </div>
-                    <div class="flex items-center gap-3">
-                        <div class="hidden sm:flex items-center gap-2 text-sm"
-                             :class="dashboard.account.status === 'running' ? 'text-emerald-600' : 'text-slate-400'">
-                            <span class="relative flex h-2.5 w-2.5">
-                                <span v-if="dashboard.account.status === 'running'"
-                                      class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-70"
-                                      :class="dashboard.account.status === 'running' ? 'bg-emerald-400' : 'bg-slate-300'"></span>
-                                <span class="relative inline-flex rounded-full h-2.5 w-2.5"
-                                      :class="dashboard.account.status === 'running' ? 'bg-emerald-500' : 'bg-slate-400'"></span>
+                    <div class="nav-actions">
+                        <div class="runtime-indicator hidden sm:flex items-center"
+                             :class="dashboard.account.status === 'running' ? 'runtime-indicator--online' : 'runtime-indicator--offline'">
+                            <span class="runtime-indicator__pulse">
+                                <span v-if="dashboard.account.status === 'running'" class="runtime-indicator__ping"></span>
+                                <span class="runtime-indicator__dot"></span>
                             </span>
-                            {{ dashboard.account.status === 'running' ? '运行中' : '已停止' }}
+                            <span class="runtime-indicator__label">
+                                {{ dashboard.account.status === 'running' ? '运行中' : '已停止' }}
+                            </span>
                         </div>
-                        <button @click="liquidateAll" class="px-3 py-2 rounded-lg bg-rose-600 text-white text-sm font-medium hover:bg-rose-700 transition shadow-sm active:scale-95" :disabled="liquidating || !authPassed">
+                        <button @click="liquidateAll" class="btn btn--danger" :disabled="liquidating || !authPassed">
                             {{ liquidating ? '平仓中...' : '一键平仓' }}
                         </button>
-                        <button @click="restartBot" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95" :disabled="restarting || !authPassed">
+                        <button @click="restartBot" class="btn btn--primary" :disabled="restarting || !authPassed">
                             {{ restarting ? '重启中...' : '重启机器人' }}
                         </button>
-                        <button @click="loadDashboard" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition shadow-sm active:scale-95" :disabled="!authPassed">刷新数据</button>
+                        <button @click="loadDashboard" class="btn btn--ghost" :disabled="!authPassed">刷新数据</button>
                     </div>
                 </div>
             </div>
@@ -195,35 +344,35 @@
         <main class="flex-1 pb-14">
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6">
                 <div class="grid lg:grid-cols-[1.5fr_1fr] gap-5">
-                    <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
+                    <div class="glass panel hero-card shadow-soft p-5 sm:p-7">
                         <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-50 text-brand-700 text-xs font-bold">账户表现</div>
                         <h1 class="mt-3 text-3xl font-extrabold text-slate-900">{{ formatCurrency(dashboard.account.equity) }}</h1>
                         <p class="text-sm text-slate-500">初始资金：{{ formatCurrency(dashboard.performance.initial_equity) }}</p>
                         <div class="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4">
-                            <div class="bg-white/60 rounded-xl p-4 border">
+                            <div class="metric-tile p-4">
                                 <div class="text-xs text-slate-500">总盈亏</div>
                                 <div class="text-lg font-bold" :class="colorClass(dashboard.performance.total_pnl)">{{ formatSignedCurrency(dashboard.performance.total_pnl) }}</div>
                             </div>
-                            <div class="bg-white/60 rounded-xl p-4 border">
+                            <div class="metric-tile p-4">
                                 <div class="text-xs text-slate-500">未实现盈亏</div>
                                 <div class="text-lg font-bold" :class="colorClass(dashboard.performance.unrealized_pnl)">{{ formatSignedCurrency(dashboard.performance.unrealized_pnl) }}</div>
                             </div>
-                            <div class="bg-white/60 rounded-xl p-4 border">
+                            <div class="metric-tile p-4">
                                 <div class="text-xs text-slate-500">收益率</div>
                                 <div class="text-lg font-bold" :class="colorClass(dashboard.performance.return_pct)">{{ formatSignedPercent(dashboard.performance.return_pct) }}</div>
                             </div>
-                            <div class="bg-white/60 rounded-xl p-4 border">
+                            <div class="metric-tile p-4">
                                 <div class="text-xs text-slate-500">运行策略</div>
                                 <div class="text-lg font-bold text-slate-800">{{ dashboard.strategies.length }}</div>
                             </div>
                         </div>
                     </div>
-                    <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
+                    <div class="glass panel panel--balanced shadow-soft p-5 sm:p-7">
                         <h2 class="text-lg font-bold text-slate-900">资产构成</h2>
                         <div class="mt-5 space-y-4">
                             <div class="flex justify-between border-b pb-3">
                                 <span class="text-sm text-slate-500">可用现金</span>
-                                <span class="font-semibold" :class="dashboard.account.cash < 0 ? 'text-rose-600' : 'text-slate-900'">{{ formatCurrency(dashboard.account.cash) }}</span>
+                                <span class="font-semibold" :class="dashboard.account.cash < 0 ? 'text-rose-500' : 'text-slate-900'">{{ formatCurrency(dashboard.account.cash) }}</span>
                             </div>
                             <div class="flex justify-between border-b pb-3">
                                 <span class="text-sm text-slate-500">购买力</span>
@@ -231,7 +380,7 @@
                             </div>
                             <div class="flex justify-between">
                                 <span class="text-sm text-slate-500">数据更新</span>
-                                <span class="text-xs font-mono bg-slate-100 px-2 py-1 rounded">{{ dashboard.updatedAt }}</span>
+                                <span class="text-xs font-mono bg-slate-100 text-slate-600 px-2 py-1 rounded">{{ dashboard.updatedAt }}</span>
                             </div>
                         </div>
                     </div>
@@ -239,7 +388,7 @@
             </section>
 
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
-                <div class="glass rounded-2xl p-5 sm:p-7 shadow-soft">
+                <div class="glass panel p-5 sm:p-7 shadow-soft">
                     <div class="flex justify-between mb-3">
                         <h2 class="text-lg font-bold">权益曲线</h2>
                         <span class="text-xs text-slate-400">快照 · {{ dashboard.snapshots.length }} 点</span>
@@ -286,7 +435,7 @@
             </section>
 
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6 grid lg:grid-cols-2 gap-5">
-                <div class="glass rounded-2xl p-5 shadow-soft">
+                <div class="glass panel p-5 shadow-soft">
                     <h2 class="text-lg font-bold mb-4">当前持仓</h2>
                     <table class="w-full text-sm">
                         <thead>
@@ -313,7 +462,7 @@
                         </tbody>
                     </table>
                 </div>
-                <div class="glass rounded-2xl p-5 shadow-soft flex flex-col">
+                <div class="glass panel p-5 shadow-soft flex flex-col">
                     <div class="flex justify-between mb-4">
                         <h2 class="text-lg font-bold">最近成交</h2>
                         <span class="text-xs bg-slate-100 px-2 py-1 rounded-full">共 {{ allTrades.length }} 条</span>
@@ -389,9 +538,9 @@
                             <div v-if="selectedStrategy.config" class="bg-brand-50 rounded-xl p-4">
                                 <h4 class="text-sm font-bold text-brand-900 mb-2">运行时配置</h4>
                                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                                    <div v-for="(val, key) in selectedStrategy.config" :key="key">
-                                        <div class="text-xs text-brand-600 capitalize">{{ key.replace(/_/g,' ') }}</div>
-                                        <div class="font-semibold text-sm">{{ val }}</div>
+                                    <div v-for="item in configEntries(selectedStrategy.config)" :key="item[0]">
+                                        <div class="text-xs text-brand-600 capitalize">{{ formatConfigKey(item[0]) }}</div>
+                                        <div class="font-semibold text-sm">{{ formatConfigValue(item[0], item[1]) }}</div>
                                     </div>
                                 </div>
                             </div>
@@ -555,6 +704,21 @@
                     return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
                 };
                 const colorClass = (v) => Number(v || 0) >= 0 ? 'text-emerald-600' : 'text-rose-600';
+
+                const formatConfigKey = (key) => key.replace(/_/g, ' ');
+                const formatConfigValue = (key, value) => {
+                    if (typeof value === 'string') {
+                        const lower = value.toLowerCase();
+                        if (lower.endsWith('ms') || lower.endsWith('s')) {
+                            return value.replace(/h/g, '小时').replace(/m/g, '分').replace(/s/g, '秒');
+                        }
+                    }
+                    return Array.isArray(value) ? value.join(', ') : value;
+                };
+                const configEntries = (cfg) => {
+                    if (!cfg || typeof cfg !== 'object') return [];
+                    return Object.entries(cfg).sort((a, b) => a[0].localeCompare(b[0]));
+                };
 
                 const formatTime = (iso) => {
                     if (!iso) return '--';
@@ -1077,6 +1241,9 @@
                     colorClass,
                     formatTime,
                     normalizeStatus,
+                    formatConfigKey,
+                    formatConfigValue,
+                    configEntries,
                     loadDashboard,
                     openStrategy,
                     closeStrategy,
