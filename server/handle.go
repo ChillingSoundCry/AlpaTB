@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -61,7 +62,9 @@ type DashboardResponse struct {
 type AccountView struct {
 	ID               string  `json:"id"`
 	Status           string  `json:"status"`
+	BrokerStatus     string  `json:"broker_status"`
 	Equity           float64 `json:"equity"`
+	ComputedEquity   float64 `json:"computed_equity"`
 	Cash             float64 `json:"cash"`
 	BuyingPower      float64 `json:"buying_power"`
 	LongMarketValue  float64 `json:"long_market_value"`
@@ -100,17 +103,20 @@ type TradeView struct {
 }
 
 type OrderView struct {
-	ID            string  `json:"id"`
-	ClientOrderID string  `json:"client_order_id"`
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"`
-	Type          string  `json:"type"`
-	Qty           float64 `json:"qty"`
-	FilledQty     float64 `json:"filled_qty"`
-	LimitPrice    float64 `json:"limit_price"`
-	Status        string  `json:"status"`
-	CreatedAt     string  `json:"created_at"`
-	Strategy      string  `json:"strategy"`
+	ID             string  `json:"id"`
+	ClientOrderID  string  `json:"client_order_id"`
+	Symbol         string  `json:"symbol"`
+	Side           string  `json:"side"`
+	Type           string  `json:"type"`
+	Qty            float64 `json:"qty"`
+	FilledQty      float64 `json:"filled_qty"`
+	LimitPrice     float64 `json:"limit_price"`
+	FilledAvgPrice float64 `json:"filled_avg_price"`
+	Status         string  `json:"status"`
+	CreatedAt      string  `json:"created_at"`
+	FilledAt       string  `json:"filled_at"`
+	UpdatedAt      string  `json:"updated_at"`
+	Strategy       string  `json:"strategy"`
 }
 
 type SnapshotView struct {
@@ -212,6 +218,14 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 	assets, errAssets := bot.TotalAssets(ctx)
 	if errAssets == nil {
 		resp.Account = formatAccount(assets, botRunning)
+		resp.Meta["account_equity_reported"] = parseFloat(assets["equity"])
+		resp.Meta["account_equity_computed"] = resp.Account.ComputedEquity
+		if rawStatus, ok := assets["status"]; ok {
+			resp.Meta["broker_account_status"] = rawStatus
+		}
+		if id, ok := assets["id"]; ok {
+			resp.Meta["account_id"] = id
+		}
 	} else {
 		resp.Meta["account_error"] = errAssets.Error()
 	}
@@ -222,6 +236,17 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 	} else {
 		resp.Meta["performance_error"] = errPerf.Error()
 	}
+
+	if (resp.Account.Equity <= 0 || math.Abs(resp.Account.Equity) < 1e-6) && math.Abs(resp.Account.ComputedEquity) > 1e-6 {
+		resp.Account.Equity = resp.Account.ComputedEquity
+	}
+	if (resp.Account.Equity <= 0 || math.Abs(resp.Account.Equity) < 1e-6) && resp.Performance.CurrentEquity > 0 {
+		resp.Account.Equity = resp.Performance.CurrentEquity
+	}
+	if math.Abs(resp.Account.Equity) < 1e-6 {
+		resp.Account.Equity = 0
+	}
+	resp.Meta["account_equity_final"] = resp.Account.Equity
 
 	positions, errPos := bot.Positions(ctx)
 	if errPos == nil {
@@ -309,14 +334,64 @@ func formatAccount(assets map[string]any, running bool) AccountView {
 	if running {
 		status = "running"
 	}
+
+	equity := parseFloat(assets["equity"])
+	cash := parseFloat(assets["cash"])
+	buyingPower := parseFloat(assets["buying_power"])
+	longMarketValue := parseFloat(assets["long_market_value"])
+	shortMarketValueRaw := parseFloat(assets["short_market_value"])
+
+	brokerStatus := ""
+	if v, ok := assets["status"]; ok {
+		brokerStatus = strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+
+	accountID := ""
+	if v, ok := assets["id"]; ok {
+		accountID = strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+
+	signedShort := shortMarketValueRaw
+	if signedShort > 0 {
+		signedShort = -signedShort
+	}
+
+	if math.Abs(longMarketValue) < 1e-6 {
+		longMarketValue = 0
+	}
+	if math.Abs(signedShort) < 1e-6 {
+		signedShort = 0
+	}
+	if math.Abs(cash) < 1e-6 {
+		cash = 0
+	}
+	if math.Abs(buyingPower) < 1e-6 {
+		buyingPower = 0
+	}
+
+	computedEquity := cash + longMarketValue + signedShort
+	if math.Abs(computedEquity) < 1e-6 {
+		computedEquity = 0
+	}
+
+	if math.Abs(equity) < 1e-6 {
+		equity = 0
+	}
+
+	if (equity <= 0 || math.Abs(equity) < 1e-6) && computedEquity > 0 {
+		equity = computedEquity
+	}
+
 	return AccountView{
-		ID:               "",
+		ID:               accountID,
 		Status:           status,
-		Equity:           parseFloat(assets["equity"]),
-		Cash:             parseFloat(assets["cash"]),
-		BuyingPower:      parseFloat(assets["buying_power"]),
-		LongMarketValue:  0,
-		ShortMarketValue: 0,
+		BrokerStatus:     brokerStatus,
+		Equity:           equity,
+		ComputedEquity:   computedEquity,
+		Cash:             cash,
+		BuyingPower:      buyingPower,
+		LongMarketValue:  longMarketValue,
+		ShortMarketValue: signedShort,
 	}
 }
 
@@ -331,32 +406,66 @@ func formatPerformance(p process.PerformanceSummary) PerformanceView {
 	}
 }
 
+func sanitizePositionSide(h process.HoldingSummary) string {
+	side := strings.ToLower(strings.TrimSpace(h.Side))
+	qty := h.Qty
+	mv := h.MarketValue
+
+	if side == "short" {
+		if qty < 0 || mv < 0 {
+			return "short"
+		}
+		return "long"
+	}
+
+	if side == "long" {
+		if qty < 0 || mv < 0 {
+			return "short"
+		}
+		return "long"
+	}
+
+	if qty < 0 || mv < 0 {
+		return "short"
+	}
+	if qty > 0 || mv > 0 {
+		return "long"
+	}
+	return "long"
+}
+
 func formatPositions(positions []process.HoldingSummary) []PositionView {
 	out := make([]PositionView, 0, len(positions))
 	for _, h := range positions {
+		side := sanitizePositionSide(h)
+		symbol := strings.ToUpper(strings.TrimSpace(h.Symbol))
 		out = append(out, PositionView{
-			Symbol:        h.Symbol,
+			Symbol:        symbol,
 			Qty:           h.Qty,
 			AvgEntryPrice: h.AvgEntryPrice,
 			MarketValue:   h.MarketValue,
 			UnrealizedPnL: h.UnrealizedPnL,
 			CurrentPrice:  h.CurrentPrice,
-			Side:          h.Side,
+			Side:          side,
 		})
 	}
 	return out
 }
 
 func formatTrade(t process.TradeRecord) TradeView {
+	side := strings.ToLower(strings.TrimSpace(t.Side))
+	symbol := strings.ToUpper(strings.TrimSpace(t.Symbol))
+	orderID := strings.TrimSpace(t.OrderID)
+	clientOrderID := strings.TrimSpace(t.ClientOrderID)
 	return TradeView{
-		ID:            t.OrderID,
+		ID:            orderID,
 		Time:          t.Time.UTC().Format(time.RFC3339),
-		Symbol:        t.Symbol,
-		Side:          t.Side,
+		Symbol:        symbol,
+		Side:          side,
 		Qty:           t.Qty,
 		Price:         t.Price,
-		OrderID:       t.OrderID,
-		ClientOrderID: t.ClientOrderID,
+		OrderID:       orderID,
+		ClientOrderID: clientOrderID,
 		Strategy:      normalizeStrategyName(t.Strategy),
 	}
 }
@@ -370,19 +479,27 @@ func formatTrades(trades []process.TradeRecord) []TradeView {
 }
 
 func formatOrder(o process.OrderSummary) OrderView {
+	side := strings.ToLower(strings.TrimSpace(o.Side))
+	typ := strings.ToLower(strings.TrimSpace(o.Type))
+	status := strings.ToLower(strings.TrimSpace(o.Status))
+	symbol := strings.ToUpper(strings.TrimSpace(o.Symbol))
 	return OrderView{
-		ID:            o.ID,
-		ClientOrderID: o.ClientOrderID,
-		Symbol:        o.Symbol,
-		Side:          o.Side,
-		Type:          o.Type,
-		Qty:           o.Qty,
-		FilledQty:     o.FilledQty,
-		LimitPrice:    o.LimitPrice,
-		Status:        o.Status,
-		CreatedAt:     o.CreatedAt,
-		Strategy:      normalizeStrategyName(o.Strategy),
+		ID:             strings.TrimSpace(o.ID),
+		ClientOrderID:  strings.TrimSpace(o.ClientOrderID),
+		Symbol:         symbol,
+		Side:           side,
+		Type:           typ,
+		Qty:            o.Qty,
+		FilledQty:      o.FilledQty,
+		LimitPrice:     o.LimitPrice,
+		FilledAvgPrice: o.FilledAvgPrice,
+		Status:         status,
+		CreatedAt:      strings.TrimSpace(o.CreatedAt),
+		FilledAt:       strings.TrimSpace(o.FilledAt),
+		UpdatedAt:      strings.TrimSpace(o.UpdatedAt),
+		Strategy:       normalizeStrategyName(o.Strategy),
 	}
+
 }
 
 func formatOrders(orders []process.OrderSummary) []OrderView {
@@ -450,6 +567,110 @@ func normalizeStrategyName(name string) string {
 	return name
 }
 
+func strategyKey(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "unknown"
+	}
+	return strings.ToLower(name)
+}
+
+func groupHasSymbol(symbols []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, sym := range symbols {
+		if strings.EqualFold(strings.TrimSpace(sym), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func pickTradeGroup(groups map[string]TradeGroup, key string, aliases ...string) TradeGroup {
+	if g, ok := groups[key]; ok && (g.Count > 0 || len(g.Trades) > 0) {
+		return g
+	}
+	for _, alias := range aliases {
+		aliasKey := strategyKey(alias)
+		if g, ok := groups[aliasKey]; ok && (g.Count > 0 || len(g.Trades) > 0) {
+			return g
+		}
+	}
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		for _, g := range groups {
+			if groupHasSymbol(g.Symbols, alias) {
+				return g
+			}
+		}
+	}
+	return TradeGroup{}
+}
+
+func pickOrderGroup(groups map[string]OrderGroup, key string, aliases ...string) OrderGroup {
+	if g, ok := groups[key]; ok && (g.Count > 0 || len(g.Orders) > 0) {
+		return g
+	}
+	for _, alias := range aliases {
+		aliasKey := strategyKey(alias)
+		if g, ok := groups[aliasKey]; ok && (g.Count > 0 || len(g.Orders) > 0) {
+			return g
+		}
+	}
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		for _, g := range groups {
+			if groupHasSymbol(g.Symbols, alias) {
+				return g
+			}
+		}
+	}
+	return OrderGroup{}
+}
+
+func pickConfig(configs map[string]any, keys ...string) any {
+	if configs == nil || len(configs) == 0 {
+		return nil
+	}
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if v, ok := configs[key]; ok {
+			return v
+		}
+		lower := strings.ToLower(key)
+		if v, ok := configs[lower]; ok {
+			return v
+		}
+		upper := strings.ToUpper(key)
+		if v, ok := configs[upper]; ok {
+			return v
+		}
+	}
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		for existKey, v := range configs {
+			if strings.EqualFold(existKey, key) {
+				return v
+			}
+		}
+	}
+	return nil
+}
+
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))
@@ -489,7 +710,7 @@ func formatTradesByStrategy(trades []process.TradeRecord) map[string]TradeGroup 
 	grouped := make(map[string]*bucket)
 
 	for _, t := range trades {
-		key := normalizeStrategyName(t.Strategy)
+		key := strategyKey(t.Strategy)
 		b := grouped[key]
 		if b == nil {
 			b = &bucket{
@@ -499,7 +720,7 @@ func formatTradesByStrategy(trades []process.TradeRecord) map[string]TradeGroup 
 			grouped[key] = b
 		}
 		b.count++
-		b.symbols[t.Symbol] = struct{}{}
+		b.symbols[strings.ToUpper(strings.TrimSpace(t.Symbol))] = struct{}{}
 		b.trades = append(b.trades, t)
 	}
 
@@ -547,7 +768,7 @@ func formatOrdersByStrategy(orders []process.OrderSummary) map[string]OrderGroup
 	grouped := make(map[string]*bucket)
 
 	for _, o := range orders {
-		key := normalizeStrategyName(o.Strategy)
+		key := strategyKey(o.Strategy)
 		b := grouped[key]
 		if b == nil {
 			b = &bucket{
@@ -557,7 +778,7 @@ func formatOrdersByStrategy(orders []process.OrderSummary) map[string]OrderGroup
 			grouped[key] = b
 		}
 		b.count++
-		b.symbols[o.Symbol] = struct{}{}
+		b.symbols[strings.ToUpper(strings.TrimSpace(o.Symbol))] = struct{}{}
 		b.orders = append(b.orders, o)
 	}
 
@@ -613,6 +834,63 @@ func filterPositionsBySymbols(positions []PositionView, symbols []string) []Posi
 	return out
 }
 
+func mergeOrdersForStrategy(existing []OrderView, allOrders []process.OrderSummary, symbols []string, identifiers ...string) []OrderView {
+	if len(existing) == 0 && len(allOrders) == 0 {
+		return []OrderView{}
+	}
+
+	merged := make(map[string]OrderView, len(existing))
+	for _, o := range existing {
+		if o.ID == "" {
+			continue
+		}
+		merged[o.ID] = o
+	}
+
+	symbolSet := make(map[string]struct{}, len(symbols))
+	for _, sym := range symbols {
+		upper := strings.ToUpper(strings.TrimSpace(sym))
+		if upper == "" {
+			continue
+		}
+		symbolSet[upper] = struct{}{}
+	}
+
+	identifierSet := make(map[string]struct{}, len(identifiers))
+	for _, id := range identifiers {
+		key := strategyKey(id)
+		if key == "" {
+			continue
+		}
+		identifierSet[key] = struct{}{}
+	}
+
+	for _, summary := range allOrders {
+		strategyKeyLower := strategyKey(summary.Strategy)
+		symbolUpper := strings.ToUpper(strings.TrimSpace(summary.Symbol))
+
+		_, strategyMatch := identifierSet[strategyKeyLower]
+		_, symbolMatch := symbolSet[symbolUpper]
+
+		if !strategyMatch && !symbolMatch {
+			continue
+		}
+
+		view := formatOrder(summary)
+		if view.ID == "" {
+			continue
+		}
+		merged[view.ID] = view
+	}
+
+	out := make([]OrderView, 0, len(merged))
+	for _, v := range merged {
+		out = append(out, v)
+	}
+	sortOrdersDesc(out)
+	return out
+}
+
 func buildStrategyDetails(
 	stats []process.StrategyStats,
 	allTrades []process.TradeRecord,
@@ -626,33 +904,87 @@ func buildStrategyDetails(
 
 	out := make([]StrategyDetail, 0, len(stats))
 	for _, s := range stats {
-		name := normalizeStrategyName(s.Name)
-		tg := tradeGroups[name]
-		og := orderGroups[name]
+		displayName := normalizeStrategyName(s.Name)
+		key := strategyKey(s.Name)
 
-		symbols := []string{s.Symbol}
-		symbols = append(symbols, tg.Symbols...)
-		symbols = append(symbols, og.Symbols...)
-		symbols = uniqueStrings(symbols)
-		sort.Strings(symbols)
+		symbolOriginal := strings.TrimSpace(s.Symbol)
+		symbolUpper := strings.ToUpper(symbolOriginal)
 
-		positions := filterPositionsBySymbols(allPositions, symbols)
+		aliases := []string{symbolOriginal, symbolUpper, displayName}
+		tradeGroup := pickTradeGroup(tradeGroups, key, aliases...)
+		orderGroup := pickOrderGroup(orderGroups, key, aliases...)
 
-		var config any
-		if configs != nil {
-			if v, ok := configs[name]; ok {
-				config = v
+		combinedSymbols := make([]string, 0, 4)
+		if symbolUpper != "" {
+			combinedSymbols = append(combinedSymbols, symbolUpper)
+		}
+		for _, sym := range tradeGroup.Symbols {
+			sym = strings.ToUpper(strings.TrimSpace(sym))
+			if sym != "" {
+				combinedSymbols = append(combinedSymbols, sym)
+			}
+		}
+		for _, sym := range orderGroup.Symbols {
+			sym = strings.ToUpper(strings.TrimSpace(sym))
+			if sym != "" {
+				combinedSymbols = append(combinedSymbols, sym)
+			}
+		}
+		combinedSymbols = uniqueStrings(combinedSymbols)
+		sort.Strings(combinedSymbols)
+
+		positions := filterPositionsBySymbols(allPositions, combinedSymbols)
+		if positions == nil {
+			positions = []PositionView{}
+		}
+
+		latestPrice := 0.0
+		if price, ok := latestPrices[symbolUpper]; ok {
+			latestPrice = price
+		} else if price, ok := latestPrices[symbolOriginal]; ok {
+			latestPrice = price
+		} else {
+			for _, sym := range combinedSymbols {
+				if price, ok := latestPrices[sym]; ok {
+					latestPrice = price
+					break
+				}
 			}
 		}
 
+		config := pickConfig(configs, key, displayName, symbolOriginal, symbolUpper)
+
+		trades := tradeGroup.Trades
+		if trades == nil {
+			trades = []TradeView{}
+		}
+
+		orders := mergeOrdersForStrategy(orderGroup.Orders, allOrders, combinedSymbols, key, displayName, symbolOriginal, symbolUpper)
+		if orders == nil {
+			orders = []OrderView{}
+		}
+
+		tradeCount := s.TradeCount
+		if tradeGroup.Count > tradeCount {
+			tradeCount = tradeGroup.Count
+		}
+		if len(trades) > tradeCount {
+			tradeCount = len(trades)
+		}
+
+		orderCount := orderGroup.Count
+		if len(orders) > orderCount {
+			orderCount = len(orders)
+		}
+
 		out = append(out, StrategyDetail{
-			ID:            name,
-			Name:          name,
-			Symbol:        s.Symbol,
-			Symbols:       symbols,
-			SymbolCount:   len(symbols),
-			TradeCount:    s.TradeCount,
-			OrderCount:    og.Count,
+			ID:            displayName,
+			Name:          displayName,
+			Symbol:        symbolUpper,
+			Symbols:       combinedSymbols,
+			SymbolCount:   len(combinedSymbols),
+			TradeCount:    tradeCount,
+			OrderCount:    orderCount,
 			PositionCount: len(positions),
 			RealizedPnL:   s.RealizedPnL,
 			UnrealizedPnL: s.UnrealizedPnL,
@@ -661,10 +993,10 @@ func buildStrategyDetails(
 			PositionQty:   s.PositionQty,
 			AvgCost:       s.AvgCost,
 			LastPrice:     s.LastPrice,
-			LatestPrice:   latestPrices[s.Symbol],
+			LatestPrice:   latestPrice,
 			Config:        config,
-			Trades:        tg.Trades,
-			Orders:        og.Orders,
+			Trades:        trades,
+			Orders:        orders,
 			Positions:     positions,
 		})
 	}

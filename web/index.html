@@ -453,8 +453,8 @@
                             <tr v-for="p in dashboard.positions" :key="p.symbol" class="hover:bg-slate-50">
                                 <td class="py-2 font-bold">{{ p.symbol }}</td>
                                 <td class="py-2">
-                                    <span :class="p.side==='long'?'text-emerald-600':'text-rose-600'">{{ p.side==='long'?'多':'空' }}</span>
-                                    {{ p.qty }}
+                                    <span :class="positionSideClass(p)">{{ positionDirection(p) }}</span>
+                                    {{ displayPositionQty(p) }}
                                 </td>
                                 <td class="py-2 text-slate-600">{{ formatPrice(p.avg_entry_price) }} / {{ formatPrice(p.current_price) }}</td>
                                 <td class="py-2 text-right font-bold" :class="colorClass(p.unrealized_pnl)">{{ formatSignedCurrency(p.unrealized_pnl) }}</td>
@@ -552,11 +552,14 @@
                                 <div v-else class="space-y-3">
                                     <div v-for="p in selectedStrategy.positions" :key="p.symbol" class="flex justify-between text-sm border-b pb-2">
                                         <div>
-                                            <div class="font-bold">{{ p.symbol }} <span class="text-xs" :class="p.side==='long'?'text-emerald-600':'text-rose-600'">{{ p.side }}</span></div>
+                                            <div class="font-bold">
+                                                {{ p.symbol }}
+                                                <span class="text-xs" :class="positionSideClass(p)">{{ positionDirection(p) }}</span>
+                                            </div>
                                             <div class="text-xs text-slate-500">成本: {{ formatPrice(p.avg_entry_price) }}</div>
                                         </div>
                                         <div class="text-right">
-                                            <div>{{ p.qty }} 股</div>
+                                            <div>{{ displayPositionQty(p) }} 股</div>
                                             <div class="text-xs font-bold" :class="colorClass(p.unrealized_pnl)">{{ formatSignedCurrency(p.unrealized_pnl) }}</div>
                                         </div>
                                     </div>
@@ -565,9 +568,9 @@
 
                             <div class="border rounded-xl p-4">
                                 <h4 class="text-sm font-bold mb-2">当前挂单</h4>
-                                <div v-if="!selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'new').length" class="text-sm text-slate-500 text-center py-4">无挂单</div>
+                                <div v-if="!selectedStrategy.orders.filter(o => isWorkingOrderStatus(o.status)).length" class="text-sm text-slate-500 text-center py-4">无挂单</div>
                                 <div v-else class="space-y-3">
-                                    <div v-for="o in selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'new')" :key="o.id" class="flex justify-between text-sm border-b pb-2">
+                                    <div v-for="o in selectedStrategy.orders.filter(o => isWorkingOrderStatus(o.status))" :key="o.id" class="flex justify-between text-sm border-b pb-2">
                                         <div>
                                             <div class="font-bold">
                                                 {{ o.symbol }}
@@ -587,9 +590,9 @@
 
                             <div class="border rounded-xl p-4">
                                 <h4 class="text-sm font-bold mb-2">已成交订单</h4>
-                                <div v-if="!selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'filled').length" class="text-sm text-slate-500 text-center py-4">无已成交订单</div>
+                                <div v-if="!selectedStrategy.orders.filter(o => isFilledOrderStatus(o.status)).length" class="text-sm text-slate-500 text-center py-4">无已成交订单</div>
                                 <div v-else class="space-y-3">
-                                    <div v-for="o in selectedStrategy.orders.filter(o => normalizeStatus(o.status) === 'filled')" :key="o.id" class="flex justify-between text-sm border-b pb-2">
+                                    <div v-for="o in selectedStrategy.orders.filter(o => isFilledOrderStatus(o.status))" :key="o.id" class="flex justify-between text-sm border-b pb-2">
                                         <div>
                                             <div class="font-bold">
                                                 {{ o.symbol }}
@@ -659,8 +662,20 @@
                 const authPassword = ref('');
                 const MSK = ref('');
 
-                const dashboard = ref({
-                    account: { status: 'stopped' },
+                const defaultAccountState = {
+                    id: '',
+                    status: 'stopped',
+                    broker_status: '',
+                    equity: 0,
+                    computed_equity: 0,
+                    cash: 0,
+                    buying_power: 0,
+                    long_market_value: 0,
+                    short_market_value: 0
+                };
+
+                const createEmptyDashboard = () => ({
+                    account: { ...defaultAccountState },
                     performance: {},
                     positions: [],
                     strategies: [],
@@ -670,6 +685,8 @@
                     errors: [],
                     updatedAt: ''
                 });
+
+                const dashboard = ref(createEmptyDashboard());
 
                 const allTrades = ref([]);
                 const selectedStrategy = ref(null);
@@ -681,6 +698,14 @@
                 const showAuthMask = computed(() => !authPassed.value);
 
                 const normalizeStatus = (status) => String(status || '').trim().toLowerCase();
+                const isWorkingOrderStatus = (status) => {
+                    const s = normalizeStatus(status);
+                    return ['new', 'accepted', 'pending_new', 'accepted_for_bidding', 'submitted', 'partially_filled', 'open', 'working', 'replaced'].includes(s);
+                };
+                const isFilledOrderStatus = (status) => {
+                    const s = normalizeStatus(status);
+                    return ['filled', 'done', 'closed', 'completed', 'success'].includes(s);
+                };
 
                 const formatPrice = (v) => {
                     const n = Number(v || 0);
@@ -704,6 +729,33 @@
                     return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
                 };
                 const colorClass = (v) => Number(v || 0) >= 0 ? 'text-emerald-600' : 'text-rose-600';
+
+                const positionDirection = (p) => {
+                    if (!p) return '空';
+                    const qty = Number(p?.qty ?? 0);
+                    if (Number.isFinite(qty)) {
+                        if (qty < 0) return '空';
+                        if (qty > 0) return '多';
+                    }
+                    const side = normalizeStatus(p?.side);
+                    if (side === 'short') return '空';
+                    if (side === 'long') return '多';
+                    return '空';
+                };
+
+                const positionSideClass = (p) => positionDirection(p) === '空' ? 'text-rose-600' : 'text-emerald-600';
+
+                const displayPositionQty = (p) => {
+                    const qty = Number(p?.qty ?? 0);
+                    if (!Number.isFinite(qty)) {
+                        return '--';
+                    }
+                    const absQty = Math.abs(qty);
+                    if (Math.abs(absQty - Math.round(absQty)) < 1e-6) {
+                        return Math.round(absQty).toString();
+                    }
+                    return absQty.toFixed(2);
+                };
 
                 const formatConfigKey = (key) => key.replace(/_/g, ' ');
                 const formatConfigValue = (key, value) => {
@@ -733,6 +785,19 @@
                     return `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${(d.getHours()).toString().padStart(2,'0')}:${(d.getMinutes()).toString().padStart(2,'0')}`;
                 };
 
+                const ensureArray = (value) => Array.isArray(value) ? value : [];
+                const ensurePlainObject = (value) => (value && typeof value === 'object' && !Array.isArray(value)) ? value : null;
+                const normalizeStrategyData = (strategy) => {
+                    const base = (strategy && typeof strategy === 'object') ? strategy : {};
+                    return {
+                        ...base,
+                        positions: ensureArray(base.positions),
+                        orders: ensureArray(base.orders),
+                        trades: ensureArray(base.trades),
+                        config: ensurePlainObject(base.config)
+                    };
+                };
+
                 function hmacSHA256(key, message) {
                     return CryptoJS.HmacSHA256(message, key).toString(CryptoJS.enc.Hex);
                 }
@@ -756,17 +821,7 @@
                     authError.value = 'Session expired, please authenticate again';
                     stopAuthTimer();
 
-                    dashboard.value = {
-                        account: { status: 'stopped' },
-                        performance: {},
-                        positions: [],
-                        strategies: [],
-                        latest_prices: {},
-                        meta: {},
-                        snapshots: [],
-                        errors: [],
-                        updatedAt: ''
-                    };
+                    dashboard.value = createEmptyDashboard();
                     allTrades.value = [];
                     selectedStrategy.value = null;
                     if (equityChart) {
@@ -888,13 +943,13 @@
 
                         dashboard.value.account = data.account || { status: 'stopped' };
                         dashboard.value.performance = data.performance || {};
-                        dashboard.value.positions = data.positions || [];
+                        dashboard.value.positions = Array.isArray(data.positions) ? data.positions : [];
                         dashboard.value.latest_prices = data.latest_prices || {};
                         dashboard.value.meta = data.meta || {};
-                        dashboard.value.snapshots = data.snapshots || [];
-                        dashboard.value.errors = data.errors || [];
+                        dashboard.value.snapshots = Array.isArray(data.snapshots) ? data.snapshots : [];
+                        dashboard.value.errors = Array.isArray(data.errors) ? data.errors : [];
                         dashboard.value.updatedAt = data.updated_at || '';
-                        dashboard.value.strategies = data.strategies || [];
+                        dashboard.value.strategies = Array.isArray(data.strategies) ? data.strategies.map(normalizeStrategyData) : [];
 
                         const trades = [];
                         if (data.trades_by_strategy) {
@@ -943,10 +998,11 @@
                 };
 
                 const openStrategy = async (strategy) => {
-                    selectedStrategy.value = strategy;
+                    const normalized = normalizeStrategyData(strategy);
+                    selectedStrategy.value = normalized;
                     strategyBarsCount.value = 0;
                     await nextTick();
-                    renderStrategyChart(strategy);
+                    renderStrategyChart(normalized);
                 };
 
                 const closeStrategy = () => {
@@ -1239,8 +1295,13 @@
                     formatSignedCurrency,
                     formatSignedPercent,
                     colorClass,
+                    positionDirection,
+                    positionSideClass,
+                    displayPositionQty,
                     formatTime,
                     normalizeStatus,
+                    isWorkingOrderStatus,
+                    isFilledOrderStatus,
                     formatConfigKey,
                     formatConfigValue,
                     configEntries,

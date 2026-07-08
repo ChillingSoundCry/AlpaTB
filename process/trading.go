@@ -209,6 +209,7 @@ type Order struct {
 	Status         string     `json:"status"`
 	CreatedAt      *time.Time `json:"created_at"`
 	FilledAt       *time.Time `json:"filled_at"`
+	UpdatedAt      *time.Time `json:"updated_at"`
 }
 
 type OrderRequest struct {
@@ -385,17 +386,20 @@ type ErrorRecord struct {
 }
 
 type OrderSummary struct {
-	ID            string  `json:"id"`
-	ClientOrderID string  `json:"client_order_id"`
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"`
-	Type          string  `json:"type"`
-	Qty           float64 `json:"qty"`
-	FilledQty     float64 `json:"filled_qty"`
-	LimitPrice    float64 `json:"limit_price"`
-	Status        string  `json:"status"`
-	CreatedAt     string  `json:"created_at"`
-	Strategy      string  `json:"strategy"`
+	ID             string  `json:"id"`
+	ClientOrderID  string  `json:"client_order_id"`
+	Symbol         string  `json:"symbol"`
+	Side           string  `json:"side"`
+	Type           string  `json:"type"`
+	Qty            float64 `json:"qty"`
+	FilledQty      float64 `json:"filled_qty"`
+	LimitPrice     float64 `json:"limit_price"`
+	FilledAvgPrice float64 `json:"filled_avg_price"`
+	Status         string  `json:"status"`
+	CreatedAt      string  `json:"created_at"`
+	FilledAt       string  `json:"filled_at"`
+	UpdatedAt      string  `json:"updated_at"`
+	Strategy       string  `json:"strategy"`
 }
 
 // -----------------------
@@ -2324,19 +2328,30 @@ func (b *Bot) AllOrders(ctx context.Context) ([]OrderSummary, error) {
 		if o.CreatedAt != nil {
 			createdAt = o.CreatedAt.Format(time.RFC3339)
 		}
+		filledAt := ""
+		if o.FilledAt != nil {
+			filledAt = o.FilledAt.Format(time.RFC3339)
+		}
+		updatedAt := ""
+		if o.UpdatedAt != nil {
+			updatedAt = o.UpdatedAt.Format(time.RFC3339)
+		}
 		strategy := detectStrategyName(o.ClientOrderID, o.Symbol)
 		out = append(out, OrderSummary{
-			ID:            o.ID,
-			ClientOrderID: o.ClientOrderID,
-			Symbol:        o.Symbol,
-			Side:          o.Side,
-			Type:          o.Type,
-			Qty:           parseFloatString(o.Qty),
-			FilledQty:     parseFloatString(o.FilledQty),
-			LimitPrice:    parseFloatString(o.LimitPrice),
-			Status:        o.Status,
-			CreatedAt:     createdAt,
-			Strategy:      strategy,
+			ID:             o.ID,
+			ClientOrderID:  o.ClientOrderID,
+			Symbol:         o.Symbol,
+			Side:           o.Side,
+			Type:           o.Type,
+			Qty:            parseFloatString(o.Qty),
+			FilledQty:      parseFloatString(o.FilledQty),
+			LimitPrice:     parseFloatString(o.LimitPrice),
+			FilledAvgPrice: parseFloatString(o.FilledAvgPrice),
+			Status:         o.Status,
+			CreatedAt:      createdAt,
+			FilledAt:       filledAt,
+			UpdatedAt:      updatedAt,
+			Strategy:       strategy,
 		})
 	}
 	return out, nil
@@ -2357,10 +2372,16 @@ func (b *Bot) TotalAssets(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	longMV := parseFloatString(acct.LongMarketValue)
+	shortMV := parseFloatString(acct.ShortMarketValue)
 	return map[string]any{
-		"equity":       parseFloatString(acct.Equity),
-		"cash":         parseFloatString(acct.Cash),
-		"buying_power": parseFloatString(acct.BuyingPower),
+		"id":                 strings.TrimSpace(acct.ID),
+		"status":             strings.TrimSpace(acct.Status),
+		"equity":             parseFloatString(acct.Equity),
+		"cash":               parseFloatString(acct.Cash),
+		"buying_power":       parseFloatString(acct.BuyingPower),
+		"long_market_value":  longMV,
+		"short_market_value": shortMV,
 	}, nil
 }
 
