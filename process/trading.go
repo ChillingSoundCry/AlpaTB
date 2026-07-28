@@ -23,10 +23,12 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://paper-api.alpaca.markets"
-	defaultDataURL = "https://data.alpaca.markets"
-	maxErrorLogLen = 200
-	maxSnapshots   = 2000
+	defaultBaseURL      = "https://paper-api.alpaca.markets"
+	defaultDataURL      = "https://data.alpaca.markets"
+	maxErrorLogLen      = 200
+	maxSnapshots        = 2000
+	priceStaleThreshold = 30 * time.Second
+	indicatorCacheTTL   = 1 * time.Minute
 )
 
 // -----------------------
@@ -296,31 +298,26 @@ func (c *AlpacaClient) CancelOrder(ctx context.Context, orderID string) error {
 }
 
 func (c *AlpacaClient) GetReferencePrice(ctx context.Context, symbol string) (float64, error) {
-	if c.priceCache != nil {
-		if price, ok := c.priceCache.Get(symbol); ok && price > 0 {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return 0, errors.New("symbol is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	// 仅依赖 websocket 价格，增加短暂重试避免启动初期无价导致策略报错
+	for i := 0; i < 5; i++ {
+		if price, ok := c.LatestPrice(symbol); ok && price > 0 {
 			return price, nil
 		}
-	}
-	var qResp QuoteResponse
-	if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/v2/stocks/%s/quotes/latest?feed=%s", c.dataURL, symbol, c.feed), nil, &qResp); err == nil {
-		if qResp.Quote.AskPrice > 0 && qResp.Quote.BidPrice > 0 {
-			price := (qResp.Quote.AskPrice + qResp.Quote.BidPrice) / 2.0
-			if c.priceCache != nil && price > 0 {
-				c.priceCache.Set(symbol, price)
-			}
-			return price, nil
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
 		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	var tResp TradeResponse
-	if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/v2/stocks/%s/trades/latest?feed=%s", c.dataURL, symbol, c.feed), nil, &tResp); err == nil {
-		if tResp.Trade.Price > 0 {
-			if c.priceCache != nil {
-				c.priceCache.Set(symbol, tResp.Trade.Price)
-			}
-			return tResp.Trade.Price, nil
-		}
-	}
-	return 0, errors.New("unable to parse reference price")
+
+	return 0, fmt.Errorf("no cached price for %s from websocket", symbol)
 }
 
 func (c *AlpacaClient) PlaceOrder(ctx context.Context, req OrderRequest) (*Order, error) {
@@ -467,12 +464,16 @@ type GridStrategy struct {
 	dailyBuyDate     string
 	dailyBuyNotional float64
 
-	ma20Mu         sync.Mutex
-	ma20CacheDay   string
-	ma20CacheAllow bool
+	ma20Mu            sync.Mutex
+	ma20CacheDay      string
+	ma20CacheAllow    bool
+	ma20Value         float64
+	ma20LastPrice     float64
+	ma20LastCheckedAt time.Time
 
 	indicatorMu        sync.Mutex
 	indicatorExpiresAt time.Time
+	indicatorUpdatedAt time.Time
 	cachedATR          float64
 	cachedEMA          float64
 	cachedVWAP         float64
@@ -549,7 +550,20 @@ func (g *GridStrategy) Name() string {
 func (g *GridStrategy) Symbol() string { return g.cfg.Symbol }
 
 func (g *GridStrategy) Config() map[string]interface{} {
-	return map[string]interface{}{
+	g.ma20Mu.Lock()
+	ma20Allowed := g.ma20CacheAllow
+	ma20Value := g.ma20Value
+	ma20Price := g.ma20LastPrice
+	ma20CheckedAt := g.ma20LastCheckedAt
+	g.ma20Mu.Unlock()
+
+	g.indicatorMu.Lock()
+	adxValue := g.cachedADX
+	adxMode := g.adxMode
+	indicatorUpdatedAt := g.indicatorUpdatedAt
+	g.indicatorMu.Unlock()
+
+	cfg := map[string]interface{}{
 		"symbol":                   g.cfg.Symbol,
 		"levels":                   g.cfg.Levels,
 		"spacing_pct":              g.cfg.SpacingPct,
@@ -574,6 +588,21 @@ func (g *GridStrategy) Config() map[string]interface{} {
 		"buy_cooldown":             g.cfg.BuyCooldown.String(),
 		"rebuild_cooldown":         g.cfg.RebuildCooldown.String(),
 	}
+
+	cfg["ma20_allowed"] = ma20Allowed
+	cfg["ma20_value"] = ma20Value
+	cfg["ma20_last_price"] = ma20Price
+	if !ma20CheckedAt.IsZero() {
+		cfg["ma20_last_checked_at"] = ma20CheckedAt.Format(time.RFC3339)
+	}
+
+	cfg["adx_value"] = adxValue
+	cfg["adx_mode"] = adxMode
+	if !indicatorUpdatedAt.IsZero() {
+		cfg["indicator_last_updated_at"] = indicatorUpdatedAt.Format(time.RFC3339)
+	}
+
+	return cfg
 }
 
 func (g *GridStrategy) checkTrendMA20(ctx context.Context) bool {
@@ -596,6 +625,8 @@ func (g *GridStrategy) checkTrendMA20(ctx context.Context) bool {
 
 	bars, err := g.client.GetBars(ctx, g.cfg.Symbol, "1Day", start, end, 100)
 	allowed := false
+	ma20Value := 0.0
+	currentPrice := 0.0
 	if err == nil && len(bars) > 0 {
 		if len(bars) > 20 {
 			bars = bars[len(bars)-20:]
@@ -604,16 +635,20 @@ func (g *GridStrategy) checkTrendMA20(ctx context.Context) bool {
 		for _, b := range bars {
 			sum += b.Close
 		}
-		ma20 := sum / float64(len(bars))
+		ma20Value = sum / float64(len(bars))
 		price, priceErr := g.client.GetReferencePrice(ctx, g.cfg.Symbol)
 		if priceErr == nil && price > 0 {
-			allowed = price > ma20
+			currentPrice = price
+			allowed = price > ma20Value
 		}
 	}
 
 	g.ma20Mu.Lock()
 	g.ma20CacheDay = today
 	g.ma20CacheAllow = allowed
+	g.ma20Value = ma20Value
+	g.ma20LastPrice = currentPrice
+	g.ma20LastCheckedAt = time.Now().UTC()
 	g.ma20Mu.Unlock()
 
 	return allowed
@@ -1021,15 +1056,23 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 	start := end.AddDate(0, 0, -30)
 
 	bars, err := g.client.GetBars(ctx, g.cfg.Symbol, "1Hour", start, end, 1000)
+	ttl := indicatorCacheTTL
+	if g.cfg.RebuildCooldown > 0 && g.cfg.RebuildCooldown < ttl {
+		ttl = g.cfg.RebuildCooldown
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+
 	if err != nil {
 		g.indicatorMu.Lock()
-		g.indicatorExpiresAt = time.Now().Add(time.Minute)
+		g.indicatorExpiresAt = time.Now().Add(ttl)
 		g.indicatorMu.Unlock()
 		return err
 	}
 	if len(bars) < 2 {
 		g.indicatorMu.Lock()
-		g.indicatorExpiresAt = time.Now().Add(time.Minute)
+		g.indicatorExpiresAt = time.Now().Add(ttl)
 		g.indicatorMu.Unlock()
 		return errors.New("insufficient bars for indicators")
 	}
@@ -1061,7 +1104,8 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 	if needsADX {
 		g.cachedADX = adx
 	}
-	g.indicatorExpiresAt = time.Now().Add(5 * time.Minute)
+	g.indicatorUpdatedAt = time.Now().UTC()
+	g.indicatorExpiresAt = time.Now().Add(ttl)
 	g.indicatorMu.Unlock()
 	return nil
 }
@@ -1607,7 +1651,7 @@ func (b *Bot) runOnce(ctx context.Context) {
 
 	livePrices := make(map[string]float64)
 	for _, sym := range symbols {
-		if price, err := b.client.GetReferencePrice(ctx, sym); err == nil && price > 0 {
+		if price, ok := b.client.LatestPrice(sym); ok && price > 0 {
 			livePrices[sym] = price
 		}
 	}
@@ -1740,6 +1784,7 @@ func (b *Bot) syncOrderFills(ctx context.Context) error {
 		b.applyGlobalFill(o.Symbol, o.Side, delta, price)
 		b.applyStrategyFill(stratName, o.Symbol, o.Side, delta, price)
 		b.seenFillQty[o.ID] = filledQty
+		b.client.CachePrice(o.Symbol, price)
 		b.lastPrices[o.Symbol] = price
 	}
 
@@ -1881,13 +1926,18 @@ func (b *Bot) recalcStrategyStatsLocked() {
 // WebSocket Streaming
 // -----------------------
 
+type priceEntry struct {
+	price float64
+	ts    time.Time
+}
+
 type PriceCache struct {
 	mu     sync.RWMutex
-	prices map[string]float64
+	prices map[string]priceEntry
 }
 
 func NewPriceCache() *PriceCache {
-	return &PriceCache{prices: map[string]float64{}}
+	return &PriceCache{prices: map[string]priceEntry{}}
 }
 
 func (pc *PriceCache) Set(symbol string, price float64) {
@@ -1895,7 +1945,7 @@ func (pc *PriceCache) Set(symbol string, price float64) {
 		return
 	}
 	pc.mu.Lock()
-	pc.prices[strings.ToUpper(strings.TrimSpace(symbol))] = price
+	pc.prices[strings.ToUpper(strings.TrimSpace(symbol))] = priceEntry{price: price, ts: time.Now()}
 	pc.mu.Unlock()
 }
 
@@ -1905,8 +1955,14 @@ func (pc *PriceCache) Get(symbol string) (float64, bool) {
 	}
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
-	v, ok := pc.prices[strings.ToUpper(strings.TrimSpace(symbol))]
-	return v, ok && v > 0
+	entry, ok := pc.prices[strings.ToUpper(strings.TrimSpace(symbol))]
+	if !ok || entry.price <= 0 {
+		return 0, false
+	}
+	if priceStaleThreshold > 0 && time.Since(entry.ts) > priceStaleThreshold {
+		return 0, false
+	}
+	return entry.price, true
 }
 
 func (pc *PriceCache) Snapshot() map[string]float64 {
@@ -1917,7 +1973,9 @@ func (pc *PriceCache) Snapshot() map[string]float64 {
 	defer pc.mu.RUnlock()
 	out := make(map[string]float64, len(pc.prices))
 	for k, v := range pc.prices {
-		out[k] = v
+		if v.price > 0 && (priceStaleThreshold <= 0 || time.Since(v.ts) <= priceStaleThreshold) {
+			out[k] = v.price
+		}
 	}
 	return out
 }
@@ -2264,6 +2322,7 @@ func (b *Bot) handleTradeUpdate(update TradeUpdateEnvelope) {
 	b.applyGlobalFill(symbol, side, delta, price)
 	b.applyStrategyFill(stratName, symbol, side, delta, price)
 	if price > 0 {
+		b.client.CachePrice(symbol, price)
 		b.lastPrices[symbol] = price
 	}
 	b.recalcStrategyStatsLocked()
@@ -2358,13 +2417,26 @@ func (b *Bot) AllOrders(ctx context.Context) ([]OrderSummary, error) {
 }
 
 func (b *Bot) LatestPrices() map[string]float64 {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	cp := make(map[string]float64, len(b.lastPrices))
-	for k, v := range b.lastPrices {
-		cp[k] = v
+	combined := make(map[string]float64)
+	if b.client != nil && b.client.priceCache != nil {
+		for k, v := range b.client.priceCache.Snapshot() {
+			if v > 0 {
+				combined[k] = v
+			}
+		}
 	}
-	return cp
+
+	b.mu.RLock()
+	for k, v := range b.lastPrices {
+		if v <= 0 {
+			continue
+		}
+		if _, ok := combined[k]; !ok {
+			combined[k] = v
+		}
+	}
+	b.mu.RUnlock()
+	return combined
 }
 
 func (b *Bot) TotalAssets(ctx context.Context) (map[string]any, error) {
