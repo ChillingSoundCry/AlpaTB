@@ -72,6 +72,7 @@ type AccountView struct {
 }
 
 type PerformanceView struct {
+	Period        string  `json:"period"`
 	InitialEquity float64 `json:"initial_equity"`
 	CurrentEquity float64 `json:"current_equity"`
 	RealizedPnL   float64 `json:"realized_pnl"`
@@ -143,26 +144,27 @@ type OrderGroup struct {
 }
 
 type StrategyDetail struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	Symbol        string         `json:"symbol"`
-	Symbols       []string       `json:"symbols"`
-	SymbolCount   int            `json:"symbol_count"`
-	TradeCount    int            `json:"trade_count"`
-	OrderCount    int            `json:"order_count"`
-	PositionCount int            `json:"position_count"`
-	RealizedPnL   float64        `json:"realized_pnl"`
-	UnrealizedPnL float64        `json:"unrealized_pnl"`
-	TotalPnL      float64        `json:"total_pnl"`
-	ReturnPct     float64        `json:"return_pct"`
-	PositionQty   float64        `json:"position_qty"`
-	AvgCost       float64        `json:"avg_cost"`
-	LastPrice     float64        `json:"last_price"`
-	LatestPrice   float64        `json:"latest_price"`
-	Config        any            `json:"config"`
-	Trades        []TradeView    `json:"trades"`
-	Orders        []OrderView    `json:"orders"`
-	Positions     []PositionView `json:"positions"`
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	Symbol          string         `json:"symbol"`
+	Symbols         []string       `json:"symbols"`
+	SymbolCount     int            `json:"symbol_count"`
+	TradeCount      int            `json:"trade_count"`
+	OrderCount      int            `json:"order_count"`
+	PositionCount   int            `json:"position_count"`
+	RealizedPnL     float64        `json:"realized_pnl"`
+	UnrealizedPnL   float64        `json:"unrealized_pnl"`
+	TotalPnL        float64        `json:"total_pnl"`
+	ReturnPct       float64        `json:"return_pct"`
+	InvestedCapital float64        `json:"invested_capital"`
+	PositionQty     float64        `json:"position_qty"`
+	AvgCost         float64        `json:"avg_cost"`
+	LastPrice       float64        `json:"last_price"`
+	LatestPrice     float64        `json:"latest_price"`
+	Config          any            `json:"config"`
+	Trades          []TradeView    `json:"trades"`
+	Orders          []OrderView    `json:"orders"`
+	Positions       []PositionView `json:"positions"`
 }
 
 func GetDashboard(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +206,10 @@ func GetDashboard(w http.ResponseWriter, r *http.Request) {
 		Status:           map[string]any{},
 		UpdatedAt:        time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006/01/02 15:04:05"),
 		Meta: map[string]any{
-			"trade_limit": 300,
+			"trade_limit":              300,
+			"performance_period":       "7D",
+			"return_pct_unit":          "percentage_points",
+			"realized_pnl_is_estimate": true,
 		},
 	}
 
@@ -397,6 +402,7 @@ func formatAccount(assets map[string]any, running bool) AccountView {
 
 func formatPerformance(p process.PerformanceSummary) PerformanceView {
 	return PerformanceView{
+		Period:        p.Period,
 		InitialEquity: p.InitialEquity,
 		CurrentEquity: p.CurrentEquity,
 		RealizedPnL:   p.RealizedPnL,
@@ -408,27 +414,14 @@ func formatPerformance(p process.PerformanceSummary) PerformanceView {
 
 func sanitizePositionSide(h process.HoldingSummary) string {
 	side := strings.ToLower(strings.TrimSpace(h.Side))
-	qty := h.Qty
-	mv := h.MarketValue
-
-	if side == "short" {
-		if qty < 0 || mv < 0 {
-			return "short"
-		}
-		return "long"
+	if side == "short" || side == "long" {
+		return side
 	}
 
-	if side == "long" {
-		if qty < 0 || mv < 0 {
-			return "short"
-		}
-		return "long"
-	}
-
-	if qty < 0 || mv < 0 {
+	if h.Qty < 0 || h.MarketValue < 0 {
 		return "short"
 	}
-	if qty > 0 || mv > 0 {
+	if h.Qty > 0 || h.MarketValue > 0 {
 		return "long"
 	}
 	return "long"
@@ -978,26 +971,27 @@ func buildStrategyDetails(
 		}
 
 		out = append(out, StrategyDetail{
-			ID:            displayName,
-			Name:          displayName,
-			Symbol:        symbolUpper,
-			Symbols:       combinedSymbols,
-			SymbolCount:   len(combinedSymbols),
-			TradeCount:    tradeCount,
-			OrderCount:    orderCount,
-			PositionCount: len(positions),
-			RealizedPnL:   s.RealizedPnL,
-			UnrealizedPnL: s.UnrealizedPnL,
-			TotalPnL:      s.TotalPnL,
-			ReturnPct:     s.ReturnPct,
-			PositionQty:   s.PositionQty,
-			AvgCost:       s.AvgCost,
-			LastPrice:     s.LastPrice,
-			LatestPrice:   latestPrice,
-			Config:        config,
-			Trades:        trades,
-			Orders:        orders,
-			Positions:     positions,
+			ID:              displayName,
+			Name:            displayName,
+			Symbol:          symbolUpper,
+			Symbols:         combinedSymbols,
+			SymbolCount:     len(combinedSymbols),
+			TradeCount:      tradeCount,
+			OrderCount:      orderCount,
+			PositionCount:   len(positions),
+			RealizedPnL:     s.RealizedPnL,
+			UnrealizedPnL:   s.UnrealizedPnL,
+			TotalPnL:        s.TotalPnL,
+			ReturnPct:       s.ReturnPct,
+			InvestedCapital: s.InvestedCapital,
+			PositionQty:     s.PositionQty,
+			AvgCost:         s.AvgCost,
+			LastPrice:       s.LastPrice,
+			LatestPrice:     latestPrice,
+			Config:          config,
+			Trades:          trades,
+			Orders:          orders,
+			Positions:       positions,
 		})
 	}
 
@@ -1028,9 +1022,16 @@ func defaultGridConfig(symbol string, qtyPerOrder, maxQty float64) process.GridC
 		ADXPeriod:             14,
 		ADXTrendThreshold:     25,
 		ADXRangeThreshold:     18,
+		EntryFilterMode:       "soft",
+		MACDFastPeriod:        12,
+		MACDSlowPeriod:        26,
+		MACDSignalPeriod:      9,
+		MACDBearishPct:        0.001,
+		MinBearishBuyLevel:    3,
 		DailyBuyNotionalLimit: 1000,
-		BuyCooldown:           10 * time.Minute,
+		BuyCooldown:           2 * time.Minute,
 		RebuildCooldown:       20 * time.Minute,
+		MaxOpenBuyOrders:      3,
 	}
 }
 
@@ -1041,9 +1042,9 @@ func StartTrade() {
 	client := process.NewAlpacaClient(cfg)
 	bot := process.NewBot(client, cfg.Interval)
 
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("LEU", 5, 25)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("CW", 2, 25)))
 	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("MOD", 5, 25)))
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("IONQ", 5, 25)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("flnc", 50, 25)))
 
 	ctx := context.Background()
 	if err := bot.Start(ctx); err != nil {

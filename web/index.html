@@ -347,23 +347,23 @@
                     <div class="glass panel hero-card shadow-soft p-5 sm:p-7">
                         <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-50 text-brand-700 text-xs font-bold">账户表现</div>
                         <h1 class="mt-3 text-3xl font-extrabold text-slate-900">{{ formatCurrency(dashboard.account.equity) }}</h1>
-                        <p class="text-sm text-slate-500">初始资金：{{ formatCurrency(dashboard.performance.initial_equity) }}</p>
+                        <p class="text-sm text-slate-500">{{ dashboard.performance.period || '7D' }} 基准权益：{{ formatCurrency(dashboard.performance.initial_equity) }}</p>
                         <div class="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4">
                             <div class="metric-tile p-4">
-                                <div class="text-xs text-slate-500">总盈亏</div>
+                                <div class="text-xs text-slate-500">7日总盈亏</div>
                                 <div class="text-lg font-bold" :class="colorClass(dashboard.performance.total_pnl)">{{ formatSignedCurrency(dashboard.performance.total_pnl) }}</div>
+                            </div>
+                            <div class="metric-tile p-4">
+                                <div class="text-xs text-slate-500">已实现盈亏（估算）</div>
+                                <div class="text-lg font-bold" :class="colorClass(dashboard.performance.realized_pnl)">{{ formatSignedCurrency(dashboard.performance.realized_pnl) }}</div>
                             </div>
                             <div class="metric-tile p-4">
                                 <div class="text-xs text-slate-500">未实现盈亏</div>
                                 <div class="text-lg font-bold" :class="colorClass(dashboard.performance.unrealized_pnl)">{{ formatSignedCurrency(dashboard.performance.unrealized_pnl) }}</div>
                             </div>
                             <div class="metric-tile p-4">
-                                <div class="text-xs text-slate-500">收益率</div>
+                                <div class="text-xs text-slate-500">7日收益率</div>
                                 <div class="text-lg font-bold" :class="colorClass(dashboard.performance.return_pct)">{{ formatSignedPercent(dashboard.performance.return_pct) }}</div>
-                            </div>
-                            <div class="metric-tile p-4">
-                                <div class="text-xs text-slate-500">运行策略</div>
-                                <div class="text-lg font-bold text-slate-800">{{ dashboard.strategies.length }}</div>
                             </div>
                         </div>
                     </div>
@@ -426,7 +426,7 @@
                             </div>
                         </div>
                         <div class="mt-5 pt-4 border-t flex justify-between text-xs text-slate-500">
-                            <span>成交: <b>{{ s.trade_count }}</b></span>
+                            <span>成交订单: <b>{{ s.trade_count }}</b></span>
                             <span>订单: <b>{{ s.order_count }}</b></span>
                             <span class="text-brand-600">详情 →</span>
                         </div>
@@ -465,7 +465,7 @@
                 <div class="glass panel p-5 shadow-soft flex flex-col">
                     <div class="flex justify-between mb-4">
                         <h2 class="text-lg font-bold">最近成交</h2>
-                        <span class="text-xs bg-slate-100 px-2 py-1 rounded-full">共 {{ allTrades.length }} 条</span>
+                        <span class="text-xs bg-slate-100 px-2 py-1 rounded-full">共 {{ dashboard.meta.trade_count_total ?? allTrades.length }} 条</span>
                     </div>
                     <div class="overflow-y-auto flex-1" style="max-height:360px;">
                         <table class="w-full text-sm">
@@ -507,7 +507,7 @@
                     <div class="px-6 py-4 border-b flex justify-between bg-slate-50/60">
                         <div>
                             <h3 class="text-2xl font-black capitalize">{{ selectedStrategy.name }} · {{ selectedStrategy.symbol }}</h3>
-                            <span class="text-xs text-slate-500">共 {{ selectedStrategy.trade_count }} 笔成交 · {{ selectedStrategy.order_count }} 笔订单</span>
+                            <span class="text-xs text-slate-500">共 {{ selectedStrategy.trade_count }} 笔成交订单 · {{ selectedStrategy.order_count }} 笔订单</span>
                         </div>
                         <button @click="closeStrategy" class="w-10 h-10 rounded-full border flex items-center justify-center hover:bg-slate-100 text-slate-500 transition active:scale-95">✕</button>
                     </div>
@@ -523,8 +523,9 @@
                                     <div class="text-xl font-bold" :class="colorClass(selectedStrategy.unrealized_pnl)">{{ formatSignedCurrency(selectedStrategy.unrealized_pnl) }}</div>
                                 </div>
                                 <div class="bg-slate-50 rounded-xl p-4">
-                                    <div class="text-xs">收益率</div>
+                                    <div class="text-xs">策略收益率（按累计买入额）</div>
                                     <div class="text-xl font-bold" :class="colorClass(selectedStrategy.return_pct)">{{ formatSignedPercent(selectedStrategy.return_pct) }}</div>
+                                    <div class="text-[10px] text-slate-400">基数 {{ formatCurrency(selectedStrategy.invested_capital) }}</div>
                                 </div>
                             </div>
                             <div class="bg-white border rounded-xl p-4 flex-1 min-h-[350px] flex flex-col">
@@ -676,7 +677,10 @@
 
                 const createEmptyDashboard = () => ({
                     account: { ...defaultAccountState },
-                    performance: {},
+                    performance: {
+                        period: '7D', initial_equity: 0, current_equity: 0,
+                        realized_pnl: 0, unrealized_pnl: 0, total_pnl: 0, return_pct: 0
+                    },
                     positions: [],
                     strategies: [],
                     latest_prices: {},
@@ -707,13 +711,18 @@
                     return ['filled', 'done', 'closed', 'completed', 'success'].includes(s);
                 };
 
+                const finiteNumber = (v, fallback = 0) => {
+                    const n = Number(v);
+                    return Number.isFinite(n) ? n : fallback;
+                };
+
                 const formatPrice = (v) => {
-                    const n = Number(v || 0);
+                    const n = finiteNumber(v);
                     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                 };
 
                 const formatNumber = (v) => {
-                    const n = Number(v || 0);
+                    const n = finiteNumber(v);
                     const str = n.toString();
                     const dotIdx = str.indexOf('.');
                     if (dotIdx >= 0 && str.length - dotIdx - 1 > 2) {
@@ -722,24 +731,25 @@
                     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                 };
 
-                const formatCurrency = (v) => '$' + Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                const formatSignedCurrency = (v) => (Number(v || 0) >= 0 ? '+' : '') + formatCurrency(v);
+                const formatCurrency = (v) => '$' + finiteNumber(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                const formatSignedCurrency = (v) => (finiteNumber(v) >= 0 ? '+' : '') + formatCurrency(v);
                 const formatSignedPercent = (v) => {
-                    const n = Number(v || 0) * 100;
+                    // API uses percentage points: 1.25 means 1.25%, not 125%.
+                    const n = finiteNumber(v);
                     return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
                 };
-                const colorClass = (v) => Number(v || 0) >= 0 ? 'text-emerald-600' : 'text-rose-600';
+                const colorClass = (v) => finiteNumber(v) >= 0 ? 'text-emerald-600' : 'text-rose-600';
 
                 const positionDirection = (p) => {
                     if (!p) return '空';
+                    const side = normalizeStatus(p?.side);
+                    if (side === 'short') return '空';
+                    if (side === 'long') return '多';
                     const qty = Number(p?.qty ?? 0);
                     if (Number.isFinite(qty)) {
                         if (qty < 0) return '空';
                         if (qty > 0) return '多';
                     }
-                    const side = normalizeStatus(p?.side);
-                    if (side === 'short') return '空';
-                    if (side === 'long') return '多';
                     return '空';
                 };
 
@@ -942,7 +952,10 @@
                         const data = await res.json();
 
                         dashboard.value.account = data.account || { status: 'stopped' };
-                        dashboard.value.performance = data.performance || {};
+                        dashboard.value.performance = {
+                            ...createEmptyDashboard().performance,
+                            ...(data.performance || {})
+                        };
                         dashboard.value.positions = Array.isArray(data.positions) ? data.positions : [];
                         dashboard.value.latest_prices = data.latest_prices || {};
                         dashboard.value.meta = data.meta || {};
@@ -951,11 +964,10 @@
                         dashboard.value.updatedAt = data.updated_at || '';
                         dashboard.value.strategies = Array.isArray(data.strategies) ? data.strategies.map(normalizeStrategyData) : [];
 
-                        const trades = [];
-                        if (data.trades_by_strategy) {
-                            Object.values(data.trades_by_strategy).forEach(g => trades.push(...(g.trades || [])));
-                        }
-                        allTrades.value = trades.sort((a, b) => new Date(b.time) - new Date(a.time));
+                        // data.trades is the authoritative de-duplicated recent list.
+                        // Group maps may contain aliases and must not be flattened.
+                        allTrades.value = (Array.isArray(data.trades) ? data.trades : [])
+                            .sort((a, b) => new Date(b.time) - new Date(a.time));
 
                         await nextTick();
                         renderEquityChart();

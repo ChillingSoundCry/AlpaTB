@@ -30,13 +30,9 @@ const (
 	maxTradeRecords     = 10000
 	processBuildVersion = "grid-safety-v5"
 
-	// The strategy normally runs every 30 seconds. Keep a small margin, then
-	// refresh through REST whenever the cached market price is older than this.
 	priceStaleThreshold = 45 * time.Second
 	priceRESTTimeout    = 5 * time.Second
 
-	// Prefer a recent trade over quote midpoint. This prevents a sparse or wide
-	// IEX quote from overwriting a more representative last-trade price.
 	tradePreferenceWindow = 20 * time.Second
 	maxQuoteSpreadPct     = 0.03
 
@@ -89,6 +85,13 @@ func getenvDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // -----------------------
@@ -156,11 +159,22 @@ func (c *AlpacaClient) doJSON(ctx context.Context, method, url string, body any,
 }
 
 type PortfolioHistory struct {
-	Timestamp []int64   `json:"timestamp"`
-	Equity    []float64 `json:"equity"`
+	Timestamp    []int64    `json:"timestamp"`
+	Equity       []float64  `json:"equity"`
+	ProfitLoss   []*float64 `json:"profit_loss"`
+	ProfitLossPC []*float64 `json:"profit_loss_pct"`
+	BaseValue    float64    `json:"base_value"`
 }
 
-func (c *AlpacaClient) GetPortfolioHistory7D(ctx context.Context) (float64, error) {
+type PortfolioPeriod struct {
+	StartEquity float64
+	TotalPnL    float64
+	ReturnPct   float64 // percentage points, e.g. 1.25 means 1.25%
+	HasPnL      bool
+	HasReturn   bool
+}
+
+func (c *AlpacaClient) GetPortfolioHistory7D(ctx context.Context) (PortfolioPeriod, error) {
 	u, _ := url.Parse(c.baseURL + "/v2/account/portfolio/history")
 	q := u.Query()
 	q.Set("period", "7D")
@@ -168,11 +182,13 @@ func (c *AlpacaClient) GetPortfolioHistory7D(ctx context.Context) (float64, erro
 	u.RawQuery = q.Encode()
 	var out PortfolioHistory
 	if err := c.doJSON(ctx, http.MethodGet, u.String(), nil, &out); err != nil {
-		return 0, err
+		return PortfolioPeriod{}, err
 	}
 	if len(out.Equity) == 0 {
-		return 0, errors.New("no portfolio history data")
+		return PortfolioPeriod{}, errors.New("no portfolio history data")
 	}
+
+	result := PortfolioPeriod{StartEquity: out.BaseValue}
 	if len(out.Timestamp) == len(out.Equity) && len(out.Timestamp) > 0 {
 		oldestIdx := 0
 		for i := 1; i < len(out.Timestamp); i++ {
@@ -180,9 +196,36 @@ func (c *AlpacaClient) GetPortfolioHistory7D(ctx context.Context) (float64, erro
 				oldestIdx = i
 			}
 		}
-		return out.Equity[oldestIdx], nil
+		if result.StartEquity <= 0 {
+			result.StartEquity = out.Equity[oldestIdx]
+		}
+	} else if result.StartEquity <= 0 {
+		result.StartEquity = out.Equity[0]
 	}
-	return out.Equity[0], nil
+
+	// Alpaca's profit_loss series is cash-flow adjusted and is therefore more
+	// reliable than subtracting two equity points when deposits/withdrawals exist.
+	if value, ok := lastNonNilFloat(out.ProfitLoss); ok {
+		result.TotalPnL = value
+		result.HasPnL = true
+	}
+	if value, ok := lastNonNilFloat(out.ProfitLossPC); ok {
+		result.ReturnPct = value * 100
+		result.HasReturn = true
+	} else if result.StartEquity > 0 {
+		result.ReturnPct = result.TotalPnL / result.StartEquity * 100
+		result.HasReturn = result.HasPnL
+	}
+	return result, nil
+}
+
+func lastNonNilFloat(values []*float64) (float64, bool) {
+	for i := len(values) - 1; i >= 0; i-- {
+		if values[i] != nil && !math.IsNaN(*values[i]) && !math.IsInf(*values[i], 0) {
+			return *values[i], true
+		}
+	}
+	return 0, false
 }
 
 type Account struct {
@@ -491,6 +534,7 @@ type HoldingSummary struct {
 }
 
 type PerformanceSummary struct {
+	Period        string  `json:"period"`
 	InitialEquity float64 `json:"initial_equity"`
 	CurrentEquity float64 `json:"current_equity"`
 	RealizedPnL   float64 `json:"realized_pnl"`
@@ -550,10 +594,6 @@ type BaseStrategy struct {
 // -----------------------
 // Grid Strategy
 // -----------------------
-// -----------------------
-// Grid Strategy
-// -----------------------
-
 type GridConfig struct {
 	Symbol             string
 	Levels             int
@@ -575,6 +615,12 @@ type GridConfig struct {
 	ADXPeriod          int
 	ADXTrendThreshold  float64
 	ADXRangeThreshold  float64
+	EntryFilterMode    string // off, soft, strict; soft avoids a single-indicator veto
+	MACDFastPeriod     int
+	MACDSlowPeriod     int
+	MACDSignalPeriod   int
+	MACDBearishPct     float64 // strong-bearish histogram threshold as a fraction of price
+	MinBearishBuyLevel int     // in soft mode, keep deeper grid orders during strong downtrends
 
 	DailyBuyNotionalLimit float64       // 当日已成交 + 未成交买单的最大金额
 	BuyCooldown           time.Duration // 从最近一次实际买入成交开始计算
@@ -585,7 +631,7 @@ type GridConfig struct {
 	BuyMarketBufferPct    float64 // 新买单至少低于当前市价的比例，默认 0.1%
 	SellMarketBufferPct   float64 // 卖价至少高于当前市价的比例，默认 0.1%
 	MaxSeedPremiumPct     float64 // 市价高于中心过多时不追种子仓，默认 0.5%
-	MaxOpenBuyOrders      int     // 同一策略最多同时存在的买单，默认 1
+	MaxOpenBuyOrders      int     // 同一策略最多同时存在的买单，默认 min(levels, 3)
 	AllowOrdersWhenClosed bool    // 默认 false，仅在正常交易时段创建或重建订单
 }
 
@@ -628,7 +674,13 @@ type GridStrategy struct {
 	cachedEMA          float64
 	cachedVWAP         float64
 	cachedADX          float64
+	cachedPlusDI       float64
+	cachedMinusDI      float64
+	cachedMACD         float64
+	cachedMACDSignal   float64
+	cachedMACDHist     float64
 	adxMode            string
+	entryFilterState   string
 }
 
 func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
@@ -645,7 +697,7 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 		cfg.RecenterPct = 0.05
 	}
 	if cfg.BuyCooldown <= 0 {
-		cfg.BuyCooldown = 5 * time.Minute
+		cfg.BuyCooldown = 2 * time.Minute
 	}
 	if cfg.RebuildCooldown <= 0 {
 		cfg.RebuildCooldown = 15 * time.Minute
@@ -672,7 +724,7 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 		cfg.MaxSeedPremiumPct = 0.005
 	}
 	if cfg.MaxOpenBuyOrders <= 0 {
-		cfg.MaxOpenBuyOrders = 1
+		cfg.MaxOpenBuyOrders = minInt(cfg.Levels, 3)
 	}
 	if cfg.MinSpacingPct < 0 {
 		cfg.MinSpacingPct = 0
@@ -705,6 +757,28 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	if cfg.ADXRangeThreshold <= 0 || cfg.ADXRangeThreshold >= cfg.ADXTrendThreshold {
 		cfg.ADXRangeThreshold = cfg.ADXTrendThreshold * 0.8
 	}
+	cfg.EntryFilterMode = strings.ToLower(strings.TrimSpace(cfg.EntryFilterMode))
+	if cfg.EntryFilterMode == "" {
+		cfg.EntryFilterMode = "soft"
+	}
+	if cfg.EntryFilterMode != "off" && cfg.EntryFilterMode != "soft" && cfg.EntryFilterMode != "strict" {
+		cfg.EntryFilterMode = "soft"
+	}
+	if cfg.MACDFastPeriod <= 0 {
+		cfg.MACDFastPeriod = 12
+	}
+	if cfg.MACDSlowPeriod <= cfg.MACDFastPeriod {
+		cfg.MACDSlowPeriod = 26
+	}
+	if cfg.MACDSignalPeriod <= 0 {
+		cfg.MACDSignalPeriod = 9
+	}
+	if cfg.MACDBearishPct <= 0 {
+		cfg.MACDBearishPct = 0.001
+	}
+	if cfg.MinBearishBuyLevel <= 0 {
+		cfg.MinBearishBuyLevel = minInt(3, cfg.Levels)
+	}
 
 	return &GridStrategy{
 		BaseStrategy:   BaseStrategy{client: client},
@@ -730,7 +804,13 @@ func (g *GridStrategy) Config() map[string]interface{} {
 
 	g.indicatorMu.Lock()
 	adxValue := g.cachedADX
+	plusDI := g.cachedPlusDI
+	minusDI := g.cachedMinusDI
+	macdValue := g.cachedMACD
+	macdSignal := g.cachedMACDSignal
+	macdHist := g.cachedMACDHist
 	adxMode := g.adxMode
+	entryFilterState := g.entryFilterState
 	indicatorUpdatedAt := g.indicatorUpdatedAt
 	g.indicatorMu.Unlock()
 
@@ -755,6 +835,12 @@ func (g *GridStrategy) Config() map[string]interface{} {
 		"adx_period":               g.cfg.ADXPeriod,
 		"adx_trend_threshold":      g.cfg.ADXTrendThreshold,
 		"adx_range_threshold":      g.cfg.ADXRangeThreshold,
+		"entry_filter_mode":        g.cfg.EntryFilterMode,
+		"macd_fast_period":         g.cfg.MACDFastPeriod,
+		"macd_slow_period":         g.cfg.MACDSlowPeriod,
+		"macd_signal_period":       g.cfg.MACDSignalPeriod,
+		"macd_bearish_pct":         g.cfg.MACDBearishPct,
+		"min_bearish_buy_level":    g.cfg.MinBearishBuyLevel,
 		"daily_buy_notional_limit": g.cfg.DailyBuyNotionalLimit,
 		"buy_cooldown":             g.cfg.BuyCooldown.String(),
 		"rebuild_cooldown":         g.cfg.RebuildCooldown.String(),
@@ -780,7 +866,13 @@ func (g *GridStrategy) Config() map[string]interface{} {
 	}
 
 	cfg["adx_value"] = adxValue
+	cfg["adx_plus_di"] = plusDI
+	cfg["adx_minus_di"] = minusDI
 	cfg["adx_mode"] = adxMode
+	cfg["macd_value"] = macdValue
+	cfg["macd_signal"] = macdSignal
+	cfg["macd_histogram"] = macdHist
+	cfg["entry_filter_state"] = entryFilterState
 	if !indicatorUpdatedAt.IsZero() {
 		cfg["indicator_last_updated_at"] = indicatorUpdatedAt.Format(time.RFC3339)
 	}
@@ -788,7 +880,7 @@ func (g *GridStrategy) Config() map[string]interface{} {
 	return cfg
 }
 
-func (g *GridStrategy) checkTrendMA20(ctx context.Context) bool {
+func (g *GridStrategy) checkTrendMA20(ctx context.Context, currentPrice float64) bool {
 	if !g.cfg.UseTrendFilter {
 		return true
 	}
@@ -817,9 +909,8 @@ func (g *GridStrategy) checkTrendMA20(ctx context.Context) bool {
 		}
 	}
 
-	currentPrice, err := g.client.GetReferencePrice(ctx, g.cfg.Symbol)
-	if err != nil || currentPrice <= 0 {
-		log.Printf("grid %s MA20 current price unavailable: %v", g.cfg.Symbol, err)
+	if currentPrice <= 0 {
+		log.Printf("grid %s MA20 current price unavailable", g.cfg.Symbol)
 		return false
 	}
 
@@ -1194,9 +1285,7 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 	g.lastRebuildAt = now
 	g.pendingOrders = make(map[string]time.Time)
 
-	allowBuys := g.checkTrendMA20(ctx) && g.allowGridBuys()
-
-	if position.Qty <= 0 && g.cfg.SeedQty > 0 && allowBuys {
+	if position.Qty <= 0 && g.cfg.SeedQty > 0 && g.allowBuyAtLevel(ctx, 0, currentPrice) {
 		maxSeedPrice := center * (1 + g.cfg.MaxSeedPremiumPct)
 		if currentPrice > maxSeedPrice {
 			g.logBuyBlocked(now, fmt.Sprintf("seed chase protection; market=%.4f max_seed=%.4f center=%.4f", currentPrice, maxSeedPrice, center))
@@ -1226,7 +1315,7 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 		gridSellPrice := center * (1 + off)
 		buyKey := formatLimitPrice(buyPrice, "buy")
 
-		if allowBuys && !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
+		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
 			projectedQty := position.Qty + pendingBuyQty + g.cfg.QtyPerOrder
 			if g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty {
 				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, g.cfg.QtyPerOrder, buyingPower, openBuyOrders)
@@ -1315,7 +1404,6 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 		}
 	}
 
-	allowBuys := g.checkTrendMA20(ctx) && g.allowGridBuys()
 	availableSellQty := math.Max(0, position.Qty-openSellQty)
 	usedBuyPrices := map[string]bool{}
 	usedSellPrices := map[string]bool{}
@@ -1329,7 +1417,7 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 		gridSellPrice := center * (1 + off)
 		buyKey := formatLimitPrice(buyPrice, "buy")
 
-		if allowBuys && !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
+		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
 			projectedQty := position.Qty + pendingBuyQty + g.cfg.QtyPerOrder
 			if g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty {
 				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, g.cfg.QtyPerOrder, buyingPower, openBuyOrders)
@@ -1482,8 +1570,9 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 	needsEMA := strings.EqualFold(g.cfg.CenterMode, "ema")
 	needsVWAP := strings.EqualFold(g.cfg.CenterMode, "vwap")
 	needsADX := g.cfg.ADXPeriod > 0 && (g.cfg.ADXTrendThreshold > 0 || g.cfg.ADXRangeThreshold > 0)
+	needsMACD := g.cfg.UseTrendFilter && g.cfg.EntryFilterMode != "off"
 
-	if !needsATR && !needsEMA && !needsVWAP && !needsADX {
+	if !needsATR && !needsEMA && !needsVWAP && !needsADX && !needsMACD {
 		return nil
 	}
 
@@ -1520,7 +1609,7 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 		return errors.New("insufficient bars for indicators")
 	}
 
-	var atr, ema, vwap, adx float64
+	var atr, ema, vwap, adx, plusDI, minusDI, macd, macdSignal, macdHist float64
 	if needsATR {
 		atr = computeATR(bars, g.cfg.ATRPeriod)
 	}
@@ -1531,7 +1620,10 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 		vwap = computeVWAP(bars, g.cfg.CenterVWAPLookback)
 	}
 	if needsADX {
-		adx = computeADX(bars, g.cfg.ADXPeriod)
+		adx, plusDI, minusDI = computeADX(bars, g.cfg.ADXPeriod)
+	}
+	if needsMACD {
+		macd, macdSignal, macdHist = computeMACD(bars, g.cfg.MACDFastPeriod, g.cfg.MACDSlowPeriod, g.cfg.MACDSignalPeriod)
 	}
 
 	g.indicatorMu.Lock()
@@ -1546,6 +1638,13 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 	}
 	if needsADX {
 		g.cachedADX = adx
+		g.cachedPlusDI = plusDI
+		g.cachedMinusDI = minusDI
+	}
+	if needsMACD {
+		g.cachedMACD = macd
+		g.cachedMACDSignal = macdSignal
+		g.cachedMACDHist = macdHist
 	}
 	g.indicatorUpdatedAt = time.Now().UTC()
 	g.indicatorExpiresAt = time.Now().Add(ttl)
@@ -1633,13 +1732,63 @@ func (g *GridStrategy) updateADXMode() string {
 	return mode
 }
 
-func (g *GridStrategy) allowGridBuys() bool {
-	if g.cfg.ADXPeriod <= 0 || (g.cfg.ADXTrendThreshold <= 0 && g.cfg.ADXRangeThreshold <= 0) {
+func (g *GridStrategy) allowBuyAtLevel(ctx context.Context, level int, currentPrice float64) bool {
+	if !g.cfg.UseTrendFilter || g.cfg.EntryFilterMode == "off" {
 		return true
 	}
+
+	// MA20 failure is fail-open: unavailable market data must not freeze entries.
+	maAllowed := g.checkTrendMA20(ctx, currentPrice)
+	g.ma20Mu.Lock()
+	maAvailable := g.ma20Value > 0 && !g.ma20ValueUpdatedAt.IsZero()
+	g.ma20Mu.Unlock()
+
 	g.indicatorMu.Lock()
-	defer g.indicatorMu.Unlock()
-	return g.adxMode != "trend"
+	macdHist := g.cachedMACDHist
+	adx := g.cachedADX
+	plusDI := g.cachedPlusDI
+	minusDI := g.cachedMinusDI
+	indicatorAvailable := !g.indicatorUpdatedAt.IsZero()
+	g.indicatorMu.Unlock()
+
+	if !maAvailable || !indicatorAvailable || currentPrice <= 0 {
+		g.setEntryFilterState("data_unavailable_fail_open")
+		return true
+	}
+
+	macdBearish := macdHist < -currentPrice*g.cfg.MACDBearishPct
+	strongDowntrend := adx >= g.cfg.ADXTrendThreshold && minusDI > plusDI
+	strongBearishConsensus := !maAllowed && macdBearish && strongDowntrend
+
+	if g.cfg.EntryFilterMode == "strict" {
+		allowed := maAllowed && !macdBearish && !strongDowntrend
+		if allowed {
+			g.setEntryFilterState("strict_allowed")
+		} else {
+			g.setEntryFilterState("strict_blocked")
+		}
+		return allowed
+	}
+
+	// Soft mode: MACD never has veto power by itself. During a confirmed strong
+	// downtrend only skip the seed/shallow levels; deeper mean-reversion orders
+	// remain live, avoiding the previous all-or-nothing missed-market behavior.
+	if strongBearishConsensus && level < g.cfg.MinBearishBuyLevel {
+		g.setEntryFilterState("soft_skip_shallow_strong_bearish")
+		return false
+	}
+	if strongBearishConsensus {
+		g.setEntryFilterState("soft_deep_levels_only")
+	} else {
+		g.setEntryFilterState("soft_allowed")
+	}
+	return true
+}
+
+func (g *GridStrategy) setEntryFilterState(state string) {
+	g.indicatorMu.Lock()
+	g.entryFilterState = state
+	g.indicatorMu.Unlock()
 }
 
 func trueRange(current, previous Bar) float64 {
@@ -1708,9 +1857,30 @@ func computeVWAP(bars []Bar, lookback int) float64 {
 	return pv / vol
 }
 
-func computeADX(bars []Bar, period int) float64 {
+func computeMACD(bars []Bar, fastPeriod, slowPeriod, signalPeriod int) (macd, signal, histogram float64) {
+	if fastPeriod <= 0 || slowPeriod <= fastPeriod || signalPeriod <= 0 || len(bars) < slowPeriod+signalPeriod {
+		return 0, 0, 0
+	}
+	fastK := 2.0 / (float64(fastPeriod) + 1)
+	slowK := 2.0 / (float64(slowPeriod) + 1)
+	signalK := 2.0 / (float64(signalPeriod) + 1)
+	fastEMA, slowEMA := bars[0].Close, bars[0].Close
+	for i := 1; i < len(bars); i++ {
+		fastEMA += (bars[i].Close - fastEMA) * fastK
+		slowEMA += (bars[i].Close - slowEMA) * slowK
+		macd = fastEMA - slowEMA
+		if i == 1 {
+			signal = macd
+		} else {
+			signal += (macd - signal) * signalK
+		}
+	}
+	return macd, signal, macd - signal
+}
+
+func computeADX(bars []Bar, period int) (adx, plusDI, minusDI float64) {
 	if period <= 0 || len(bars) < period+2 {
-		return 0
+		return 0, 0, 0
 	}
 
 	n := len(bars)
@@ -1738,12 +1908,12 @@ func computeADX(bars []Bar, period int) float64 {
 		minus14 += minusDM[i]
 	}
 	if tr14 == 0 {
-		return 0
+		return 0, 0, 0
 	}
 
 	dxs := make([]float64, 0, n-period)
-	plusDI := 100 * (plus14 / tr14)
-	minusDI := 100 * (minus14 / tr14)
+	plusDI = 100 * (plus14 / tr14)
+	minusDI = 100 * (minus14 / tr14)
 	denom := plusDI + minusDI
 	if denom != 0 {
 		dxs = append(dxs, 100*math.Abs(plusDI-minusDI)/denom)
@@ -1768,7 +1938,7 @@ func computeADX(bars []Bar, period int) float64 {
 	}
 
 	if len(dxs) == 0 {
-		return 0
+		return 0, plusDI, minusDI
 	}
 
 	window := period
@@ -1779,7 +1949,7 @@ func computeADX(bars []Bar, period int) float64 {
 	for i := len(dxs) - window; i < len(dxs); i++ {
 		sum += dxs[i]
 	}
-	return sum / float64(window)
+	return sum / float64(window), plusDI, minusDI
 }
 
 // -----------------------
@@ -2066,23 +2236,25 @@ type PositionLot struct {
 }
 
 type StrategyStats struct {
-	Name          string
-	Symbol        string
-	TradeCount    int
-	RealizedPnL   float64
-	UnrealizedPnL float64
-	TotalPnL      float64
-	ReturnPct     float64
-	PositionQty   float64
-	AvgCost       float64
-	LastPrice     float64
+	Name            string
+	Symbol          string
+	TradeCount      int
+	RealizedPnL     float64
+	UnrealizedPnL   float64
+	TotalPnL        float64
+	ReturnPct       float64
+	InvestedCapital float64
+	PositionQty     float64
+	AvgCost         float64
+	LastPrice       float64
 }
 
 type strategyLedger struct {
-	lots        map[string][]PositionLot
-	realizedPnL float64
-	tradeCount  int
-	seenOrders  map[string]struct{}
+	lots             map[string][]PositionLot
+	realizedPnL      float64
+	grossBuyNotional float64
+	tradeCount       int
+	seenOrders       map[string]struct{}
 }
 
 type Bot struct {
@@ -2448,6 +2620,7 @@ func (b *Bot) applyStrategyFill(stratName, symbol, side, orderID string, qty, pr
 		fillTime = time.Now().UTC()
 	}
 	if side == "buy" {
+		ledger.grossBuyNotional += qty * price
 		ledger.lots[symbol] = append(ledger.lots[symbol], PositionLot{Qty: qty, Price: price, Time: fillTime})
 	} else if side == "sell" {
 		ledger.lots[symbol] = consumeLots(ledger.lots[symbol], qty, price, &ledger.realizedPnL)
@@ -2490,6 +2663,7 @@ func (b *Bot) recalcStrategyStatsLocked() {
 		}
 		stat.TradeCount = ledger.tradeCount
 		stat.RealizedPnL = ledger.realizedPnL
+		stat.InvestedCapital = ledger.grossBuyNotional
 
 		symbol := strings.ToUpper(strings.TrimSpace(stat.Symbol))
 		live, ok := b.livePositions[symbol]
@@ -2537,6 +2711,7 @@ func (b *Bot) recalcStrategyStatsLocked() {
 				stat.UnrealizedPnL = 0
 			}
 			stat.TotalPnL = stat.RealizedPnL + stat.UnrealizedPnL
+			updateStrategyReturn(stat)
 			continue
 		}
 
@@ -2549,6 +2724,7 @@ func (b *Bot) recalcStrategyStatsLocked() {
 			stat.LastPrice = b.lastPrices[symbol]
 			stat.UnrealizedPnL = 0
 			stat.TotalPnL = stat.RealizedPnL
+			updateStrategyReturn(stat)
 			continue
 		}
 
@@ -2570,7 +2746,18 @@ func (b *Bot) recalcStrategyStatsLocked() {
 		stat.LastPrice = mark
 		stat.UnrealizedPnL = unrealized
 		stat.TotalPnL = stat.RealizedPnL + stat.UnrealizedPnL
+		updateStrategyReturn(stat)
 	}
+}
+
+func updateStrategyReturn(stat *StrategyStats) {
+	if stat == nil || stat.InvestedCapital <= 0 {
+		if stat != nil {
+			stat.ReturnPct = 0
+		}
+		return
+	}
+	stat.ReturnPct = stat.TotalPnL / stat.InvestedCapital * 100
 }
 
 // -----------------------
@@ -3452,10 +3639,24 @@ func (b *Bot) Performance(ctx context.Context) (PerformanceSummary, error) {
 	}
 	currentEquity := parseFloatString(acct.Equity)
 	periodEquity := b.initialEquity
-	if histEquity, err := b.client.GetPortfolioHistory7D(ctx); err == nil && histEquity > 0 {
-		periodEquity = histEquity
-	}
 	totalPnL := currentEquity - periodEquity
+	returnPct := 0.0
+	if periodEquity > 0 {
+		returnPct = totalPnL / periodEquity * 100
+	}
+	if period, historyErr := b.client.GetPortfolioHistory7D(ctx); historyErr == nil && period.StartEquity > 0 {
+		periodEquity = period.StartEquity
+		if period.HasPnL {
+			totalPnL = period.TotalPnL
+		} else {
+			totalPnL = currentEquity - periodEquity
+		}
+		if period.HasReturn {
+			returnPct = period.ReturnPct
+		} else {
+			returnPct = totalPnL / periodEquity * 100
+		}
+	}
 	positions, err := b.client.GetPositions(ctx)
 	if err != nil {
 		return PerformanceSummary{}, err
@@ -3476,17 +3677,14 @@ func (b *Bot) Performance(ctx context.Context) (PerformanceSummary, error) {
 		}
 	}
 	realized := totalPnL - unrealized
-	ret := 0.0
-	if b.initialEquity > 0 {
-		ret = (currentEquity - b.initialEquity) / b.initialEquity * 100
-	}
 	return PerformanceSummary{
+		Period:        "7D",
 		InitialEquity: periodEquity,
 		CurrentEquity: currentEquity,
 		RealizedPnL:   realized,
 		UnrealizedPnL: unrealized,
 		TotalPnL:      totalPnL,
-		ReturnPct:     ret,
+		ReturnPct:     returnPct,
 	}, nil
 }
 
