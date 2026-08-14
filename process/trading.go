@@ -28,7 +28,7 @@ const (
 	maxErrorLogLen      = 200
 	maxSnapshots        = 2000
 	maxTradeRecords     = 10000
-	processBuildVersion = "grid-safety-v5"
+	processBuildVersion = "grid-live-safe-v6"
 
 	priceStaleThreshold = 45 * time.Second
 	priceRESTTimeout    = 5 * time.Second
@@ -53,6 +53,7 @@ type Config struct {
 	DataFeed    string
 	HTTPTimeout time.Duration
 	Interval    time.Duration
+	IsPaper     bool
 }
 
 func LoadConfig() Config {
@@ -69,14 +70,21 @@ func LoadConfig() Config {
 		}
 	}
 
+	baseURL := getenvDefault("APCA_BASE_URL", defaultBaseURL)
+	isPaper := strings.Contains(strings.ToLower(baseURL), "paper") || strings.Contains(strings.ToLower(baseURL), "sandbox")
+	if !isPaper && strings.TrimSpace(os.Getenv("LIVE_TRADING_ACK")) != "I_UNDERSTAND_REAL_MONEY_RISK" {
+		log.Fatal("live endpoint refused: set LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_RISK after completing paper and risk checks")
+	}
+
 	return Config{
 		APIKey:      apiKey,
 		APISecret:   apiSecret,
-		BaseURL:     getenvDefault("APCA_BASE_URL", defaultBaseURL),
+		BaseURL:     baseURL,
 		DataURL:     getenvDefault("APCA_DATA_URL", defaultDataURL),
 		DataFeed:    getenvDefault("APCA_DATA_FEED", "iex"),
 		HTTPTimeout: 12 * time.Second,
 		Interval:    time.Duration(intervalSec) * time.Second,
+		IsPaper:     isPaper,
 	}
 }
 
@@ -94,6 +102,35 @@ func minInt(a, b int) int {
 	return b
 }
 
+func getenvFloat(key string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		log.Printf("invalid %s=%q; using %.6f", key, raw, fallback)
+		return fallback
+	}
+	return value
+}
+
+func getenvBool(key string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		log.Printf("invalid %s=%q; using %t", key, raw, fallback)
+		return fallback
+	}
+}
+
 // -----------------------
 // Alpaca REST client
 // -----------------------
@@ -102,6 +139,7 @@ type AlpacaClient struct {
 	baseURL    string
 	dataURL    string
 	feed       string
+	isPaper    bool
 	apiKey     string
 	secret     string
 	client     *http.Client
@@ -110,6 +148,8 @@ type AlpacaClient struct {
 	wsMu          sync.Mutex
 	marketCancel  context.CancelFunc
 	tradingCancel context.CancelFunc
+	marketConn    *websocket.Conn
+	tradingConn   *websocket.Conn
 }
 
 func NewAlpacaClient(cfg Config) *AlpacaClient {
@@ -117,11 +157,19 @@ func NewAlpacaClient(cfg Config) *AlpacaClient {
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		dataURL:    strings.TrimRight(cfg.DataURL, "/"),
 		feed:       cfg.DataFeed,
+		isPaper:    cfg.IsPaper,
 		apiKey:     cfg.APIKey,
 		secret:     cfg.APISecret,
 		client:     &http.Client{Timeout: cfg.HTTPTimeout},
 		priceCache: NewPriceCache(),
 	}
+}
+
+func (c *AlpacaClient) TradingMode() string {
+	if c != nil && c.isPaper {
+		return "paper"
+	}
+	return "live"
 }
 
 func (c *AlpacaClient) doJSON(ctx context.Context, method, url string, body any, out any) error {
@@ -229,13 +277,18 @@ func lastNonNilFloat(values []*float64) (float64, bool) {
 }
 
 type Account struct {
-	ID               string `json:"id"`
-	Status           string `json:"status"`
-	Equity           string `json:"equity"`
-	Cash             string `json:"cash"`
-	BuyingPower      string `json:"buying_power"`
-	LongMarketValue  string `json:"long_market_value"`
-	ShortMarketValue string `json:"short_market_value"`
+	ID                       string `json:"id"`
+	Status                   string `json:"status"`
+	Equity                   string `json:"equity"`
+	Cash                     string `json:"cash"`
+	BuyingPower              string `json:"buying_power"`
+	NonMarginableBuyingPower string `json:"non_marginable_buying_power"`
+	LongMarketValue          string `json:"long_market_value"`
+	ShortMarketValue         string `json:"short_market_value"`
+	MaintenanceMargin        string `json:"maintenance_margin"`
+	TradingBlocked           bool   `json:"trading_blocked"`
+	AccountBlocked           bool   `json:"account_blocked"`
+	TradeSuspendedByUser     bool   `json:"trade_suspended_by_user"`
 }
 
 type Clock struct {
@@ -367,6 +420,25 @@ func (c *AlpacaClient) GetOrder(ctx context.Context, orderID string) (*Order, er
 	return &out, nil
 }
 
+func (c *AlpacaClient) GetOrderByClientOrderID(ctx context.Context, clientOrderID string) (*Order, error) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return nil, errors.New("client order id is required")
+	}
+	u, err := url.Parse(c.baseURL + "/v2/orders:by_client_order_id")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("client_order_id", clientOrderID)
+	u.RawQuery = q.Encode()
+	var out Order
+	if err := c.doJSON(ctx, http.MethodGet, u.String(), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *AlpacaClient) GetAccount(ctx context.Context) (*Account, error) {
 	var out Account
 	if err := c.doJSON(ctx, http.MethodGet, c.baseURL+"/v2/account", nil, &out); err != nil {
@@ -476,8 +548,68 @@ func (c *AlpacaClient) PlaceOrder(ctx context.Context, req OrderRequest) (*Order
 	return &out, nil
 }
 
-func (c *AlpacaClient) CloseAllPositions(ctx context.Context) error {
-	return c.doJSON(ctx, http.MethodDelete, c.baseURL+"/v2/positions?cancel_orders=true", nil, nil)
+func (c *AlpacaClient) PlaceOrderIdempotent(ctx context.Context, req OrderRequest) (*Order, error) {
+	if strings.TrimSpace(req.ClientOrderID) == "" {
+		return nil, errors.New("idempotent order requires client_order_id")
+	}
+	out, submitErr := c.PlaceOrder(ctx, req)
+	if submitErr == nil {
+		return out, nil
+	}
+
+	// A timeout can occur after the broker accepted the order. Reconcile by the
+	// stable client id using a detached, read-only context before reporting failure.
+	lookupCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	existing, lookupErr := c.GetOrderByClientOrderID(lookupCtx, req.ClientOrderID)
+	if lookupErr == nil && existing != nil {
+		status := strings.ToLower(strings.TrimSpace(existing.Status))
+		if status != "rejected" && status != "canceled" && status != "expired" {
+			return existing, nil
+		}
+	}
+	return nil, fmt.Errorf("submit order %s failed: %w (reconcile: %v)", req.ClientOrderID, submitErr, lookupErr)
+}
+
+type BulkActionResult struct {
+	ID     string          `json:"id"`
+	Symbol string          `json:"symbol"`
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body"`
+}
+
+func (c *AlpacaClient) CancelAllOrders(ctx context.Context) ([]BulkActionResult, error) {
+	var out []BulkActionResult
+	if err := c.doJSON(ctx, http.MethodDelete, c.baseURL+"/v2/orders", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, validateBulkResults("cancel orders", out)
+}
+
+func (c *AlpacaClient) CloseAllPositions(ctx context.Context) ([]BulkActionResult, error) {
+	var out []BulkActionResult
+	if err := c.doJSON(ctx, http.MethodDelete, c.baseURL+"/v2/positions?cancel_orders=true", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, validateBulkResults("close positions", out)
+}
+
+func validateBulkResults(action string, results []BulkActionResult) error {
+	failed := make([]string, 0)
+	for _, result := range results {
+		if result.Status >= 200 && result.Status < 300 {
+			continue
+		}
+		target := strings.TrimSpace(result.Symbol)
+		if target == "" {
+			target = strings.TrimSpace(result.ID)
+		}
+		failed = append(failed, fmt.Sprintf("%s(status=%d body=%s)", target, result.Status, truncateLog(string(result.Body), 160)))
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%s partially failed: %s", action, strings.Join(failed, "; "))
+	}
+	return nil
 }
 
 func parseFloatString(s string) float64 {
@@ -543,6 +675,61 @@ type PerformanceSummary struct {
 	ReturnPct     float64 `json:"return_pct"`
 }
 
+type RiskConfig struct {
+	CashOnly             bool
+	MaxDailyLossPct      float64
+	MaxDrawdownPct       float64
+	MaxGrossExposurePct  float64
+	MaxSymbolExposurePct float64
+	LiquidateOnRiskHalt  bool
+	StateFile            string
+}
+
+func LoadRiskConfig() RiskConfig {
+	cfg := RiskConfig{
+		CashOnly:             getenvBool("RISK_CASH_ONLY", true),
+		MaxDailyLossPct:      getenvFloat("RISK_MAX_DAILY_LOSS_PCT", 0.01),
+		MaxDrawdownPct:       getenvFloat("RISK_MAX_DRAWDOWN_PCT", 0.05),
+		MaxGrossExposurePct:  getenvFloat("RISK_MAX_GROSS_EXPOSURE_PCT", 0.35),
+		MaxSymbolExposurePct: getenvFloat("RISK_MAX_SYMBOL_EXPOSURE_PCT", 0.12),
+		LiquidateOnRiskHalt:  getenvBool("RISK_LIQUIDATE_ON_HALT", true),
+		StateFile:            getenvDefault("RISK_STATE_FILE", "bot_risk_state.json"),
+	}
+	for name, value := range map[string]*float64{
+		"RISK_MAX_DAILY_LOSS_PCT":      &cfg.MaxDailyLossPct,
+		"RISK_MAX_DRAWDOWN_PCT":        &cfg.MaxDrawdownPct,
+		"RISK_MAX_GROSS_EXPOSURE_PCT":  &cfg.MaxGrossExposurePct,
+		"RISK_MAX_SYMBOL_EXPOSURE_PCT": &cfg.MaxSymbolExposurePct,
+	} {
+		if *value < 0 || *value > 1 {
+			log.Printf("%s must be between 0 and 1; risk-safe default retained", name)
+			switch name {
+			case "RISK_MAX_DAILY_LOSS_PCT":
+				*value = 0.01
+			case "RISK_MAX_DRAWDOWN_PCT":
+				*value = 0.05
+			case "RISK_MAX_GROSS_EXPOSURE_PCT":
+				*value = 0.35
+			case "RISK_MAX_SYMBOL_EXPOSURE_PCT":
+				*value = 0.12
+			}
+		}
+	}
+	return cfg
+}
+
+type RiskState struct {
+	Halted           bool    `json:"halted"`
+	Reason           string  `json:"reason"`
+	SessionDay       string  `json:"session_day"`
+	SessionEquity    float64 `json:"session_equity"`
+	HighWaterEquity  float64 `json:"high_water_equity"`
+	DailyLossPct     float64 `json:"daily_loss_pct"`
+	DrawdownPct      float64 `json:"drawdown_pct"`
+	GrossExposurePct float64 `json:"gross_exposure_pct"`
+	UpdatedAt        string  `json:"updated_at"`
+}
+
 type DailySnapshot struct {
 	Time   time.Time `json:"time"`
 	Equity float64   `json:"equity"`
@@ -594,33 +781,36 @@ type BaseStrategy struct {
 // -----------------------
 // Grid Strategy
 // -----------------------
+
 type GridConfig struct {
-	Symbol             string
-	Levels             int
-	SpacingPct         float64
-	MinSpacingPct      float64
-	MaxSpacingPct      float64
-	QtyPerOrder        float64
-	SeedQty            float64
-	MinPrice           float64
-	MaxPrice           float64
-	RecenterPct        float64
-	MaxPositionQty     float64 // 最大仓位限制
-	UseTrendFilter     bool    // 网格趋势过滤开关
-	ATRPeriod          int
-	ATRMultiplier      float64
-	CenterMode         string
-	CenterEMAPeriod    int
-	CenterVWAPLookback int
-	ADXPeriod          int
-	ADXTrendThreshold  float64
-	ADXRangeThreshold  float64
-	EntryFilterMode    string // off, soft, strict; soft avoids a single-indicator veto
-	MACDFastPeriod     int
-	MACDSlowPeriod     int
-	MACDSignalPeriod   int
-	MACDBearishPct     float64 // strong-bearish histogram threshold as a fraction of price
-	MinBearishBuyLevel int     // in soft mode, keep deeper grid orders during strong downtrends
+	Symbol              string
+	Levels              int
+	SpacingPct          float64
+	MinSpacingPct       float64
+	MaxSpacingPct       float64
+	QtyPerOrder         float64
+	SeedQty             float64
+	OrderNotional       float64 // preferred live sizing; whole-share quantity is derived per price
+	MaxPositionNotional float64
+	MinPrice            float64
+	MaxPrice            float64
+	RecenterPct         float64
+	MaxPositionQty      float64 // 最大仓位限制
+	UseTrendFilter      bool    // 网格趋势过滤开关
+	ATRPeriod           int
+	ATRMultiplier       float64
+	CenterMode          string
+	CenterEMAPeriod     int
+	CenterVWAPLookback  int
+	ADXPeriod           int
+	ADXTrendThreshold   float64
+	ADXRangeThreshold   float64
+	EntryFilterMode     string // off, soft, strict; soft avoids a single-indicator veto
+	MACDFastPeriod      int
+	MACDSlowPeriod      int
+	MACDSignalPeriod    int
+	MACDBearishPct      float64 // strong-bearish histogram threshold as a fraction of price
+	MinBearishBuyLevel  int     // in soft mode, keep deeper grid orders during strong downtrends
 
 	DailyBuyNotionalLimit float64       // 当日已成交 + 未成交买单的最大金额
 	BuyCooldown           time.Duration // 从最近一次实际买入成交开始计算
@@ -645,7 +835,8 @@ type GridStrategy struct {
 	lastBuyAt      time.Time
 	lastRebuildAt  time.Time
 
-	pendingOrders map[string]time.Time
+	pendingOrders    map[string]time.Time
+	uncertainIntents map[string]orderIntent
 
 	dailyBuyDate       string
 	dailyBuyNotional   float64
@@ -683,6 +874,11 @@ type GridStrategy struct {
 	entryFilterState   string
 }
 
+type orderIntent struct {
+	ClientOrderID string
+	CreatedAt     time.Time
+}
+
 func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	if cfg.Levels < 1 {
 		cfg.Levels = 1
@@ -692,6 +888,12 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	}
 	if cfg.QtyPerOrder <= 0 {
 		cfg.QtyPerOrder = 1
+	}
+	if cfg.OrderNotional < 0 {
+		cfg.OrderNotional = 0
+	}
+	if cfg.MaxPositionNotional < 0 {
+		cfg.MaxPositionNotional = 0
 	}
 	if cfg.RecenterPct <= 0 {
 		cfg.RecenterPct = 0.05
@@ -781,10 +983,11 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	}
 
 	return &GridStrategy{
-		BaseStrategy:   BaseStrategy{client: client},
-		cfg:            cfg,
-		currentSpacing: cfg.SpacingPct,
-		pendingOrders:  make(map[string]time.Time),
+		BaseStrategy:     BaseStrategy{client: client},
+		cfg:              cfg,
+		currentSpacing:   cfg.SpacingPct,
+		pendingOrders:    make(map[string]time.Time),
+		uncertainIntents: make(map[string]orderIntent),
 	}
 }
 
@@ -822,6 +1025,8 @@ func (g *GridStrategy) Config() map[string]interface{} {
 		"max_spacing_pct":          g.cfg.MaxSpacingPct,
 		"qty_per_order":            g.cfg.QtyPerOrder,
 		"seed_qty":                 g.cfg.SeedQty,
+		"order_notional":           g.cfg.OrderNotional,
+		"max_position_notional":    g.cfg.MaxPositionNotional,
 		"min_price":                g.cfg.MinPrice,
 		"max_price":                g.cfg.MaxPrice,
 		"recenter_pct":             g.cfg.RecenterPct,
@@ -984,7 +1189,7 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 	if err != nil {
 		return fmt.Errorf("grid %s position lookup failed: %w", g.cfg.Symbol, err)
 	}
-	if position.Qty > 0 && position.Side == "short" {
+	if math.Abs(position.Qty) > 1e-9 && position.Side == "short" {
 		return fmt.Errorf("grid %s is long-only but account position is short", g.cfg.Symbol)
 	}
 
@@ -1269,6 +1474,42 @@ func (g *GridStrategy) protectedSellPrice(gridPrice, avgEntryPrice, currentPrice
 	return normalizeLimitPrice(floor, "sell")
 }
 
+func (g *GridStrategy) quantityForPrice(price, fallbackQty float64) float64 {
+	if price <= 0 {
+		return 0
+	}
+	if g.cfg.OrderNotional > 0 {
+		// Whole shares keep limit-order behavior consistent across live accounts.
+		return math.Floor(g.cfg.OrderNotional / price)
+	}
+	return fallbackQty
+}
+
+func (g *GridStrategy) canAddPosition(positionQty, pendingQty, addQty, orderPrice, currentPrice float64) bool {
+	projectedQty := math.Max(0, positionQty) + math.Max(0, pendingQty) + math.Max(0, addQty)
+	if g.cfg.MaxPositionQty > 0 && projectedQty > g.cfg.MaxPositionQty+1e-9 {
+		return false
+	}
+	mark := math.Max(orderPrice, currentPrice)
+	if g.cfg.MaxPositionNotional > 0 && mark > 0 && projectedQty*mark > g.cfg.MaxPositionNotional+1e-9 {
+		return false
+	}
+	return true
+}
+
+func (g *GridStrategy) clientOrderIDFor(key, prefix string) string {
+	if intent, ok := g.uncertainIntents[key]; ok && time.Since(intent.CreatedAt) < 10*time.Minute {
+		return intent.ClientOrderID
+	}
+	id := fmt.Sprintf("%s-%s-%d", prefix, strings.ToLower(g.cfg.Symbol), time.Now().UnixNano())
+	g.uncertainIntents[key] = orderIntent{ClientOrderID: id, CreatedAt: time.Now()}
+	return id
+}
+
+func (g *GridStrategy) clearOrderIntent(key string) {
+	delete(g.uncertainIntents, key)
+}
+
 func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64, position positionState, pendingBuyQty float64, openBuyOrders int, buyingPower, currentPrice float64) error {
 	now := time.Now()
 	if spacing <= 0 {
@@ -1285,16 +1526,16 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 	g.lastRebuildAt = now
 	g.pendingOrders = make(map[string]time.Time)
 
-	if position.Qty <= 0 && g.cfg.SeedQty > 0 && g.allowBuyAtLevel(ctx, 0, currentPrice) {
+	seedQty := g.quantityForPrice(currentPrice, g.cfg.SeedQty)
+	if position.Qty <= 0 && seedQty > 0 && g.allowBuyAtLevel(ctx, 0, currentPrice) {
 		maxSeedPrice := center * (1 + g.cfg.MaxSeedPremiumPct)
 		if currentPrice > maxSeedPrice {
 			g.logBuyBlocked(now, fmt.Sprintf("seed chase protection; market=%.4f max_seed=%.4f center=%.4f", currentPrice, maxSeedPrice, center))
 		} else {
-			projectedQty := pendingBuyQty + g.cfg.SeedQty
 			seedPrice := normalizeLimitPrice(currentPrice, "buy")
-			notional := seedPrice * g.cfg.SeedQty
-			if (g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty) && buyingPower >= notional && g.canBuy(now, notional, openBuyOrders) {
-				newBP, placed := g.placeSeedBuyIfSafe(ctx, seedPrice, g.cfg.SeedQty, buyingPower, openBuyOrders)
+			notional := seedPrice * seedQty
+			if g.canAddPosition(position.Qty, pendingBuyQty, seedQty, seedPrice, currentPrice) && buyingPower >= notional && g.canBuy(now, notional, openBuyOrders) {
+				newBP, placed := g.placeSeedBuyIfSafe(ctx, seedPrice, seedQty, buyingPower, openBuyOrders)
 				if placed {
 					_ = newBP
 					return nil
@@ -1316,12 +1557,12 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 		buyKey := formatLimitPrice(buyPrice, "buy")
 
 		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
-			projectedQty := position.Qty + pendingBuyQty + g.cfg.QtyPerOrder
-			if g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty {
-				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, g.cfg.QtyPerOrder, buyingPower, openBuyOrders)
+			buyQty := g.quantityForPrice(buyPrice, g.cfg.QtyPerOrder)
+			if buyQty > 0 && g.canAddPosition(position.Qty, pendingBuyQty, buyQty, buyPrice, currentPrice) {
+				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, buyQty, buyingPower, openBuyOrders)
 				if placed {
 					buyingPower = newBP
-					pendingBuyQty += g.cfg.QtyPerOrder
+					pendingBuyQty += buyQty
 					openBuyOrders++
 					usedBuyPrices[buyKey] = true
 				}
@@ -1332,7 +1573,7 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 			sellPrice := g.protectedSellPrice(gridSellPrice, position.AvgEntryPrice, currentPrice, level)
 			sellKey := formatLimitPrice(sellPrice, "sell")
 			if !usedSellPrices[sellKey] && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
-				qty := math.Min(g.cfg.QtyPerOrder, availableSellQty)
+				qty := math.Min(math.Max(1, g.quantityForPrice(sellPrice, g.cfg.QtyPerOrder)), availableSellQty)
 				if qty > 0 && g.placeSellIfSafe(ctx, level, sellPrice, qty) {
 					availableSellQty -= qty
 					usedSellPrices[sellKey] = true
@@ -1418,12 +1659,12 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 		buyKey := formatLimitPrice(buyPrice, "buy")
 
 		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
-			projectedQty := position.Qty + pendingBuyQty + g.cfg.QtyPerOrder
-			if g.cfg.MaxPositionQty <= 0 || projectedQty <= g.cfg.MaxPositionQty {
-				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, g.cfg.QtyPerOrder, buyingPower, openBuyOrders)
+			buyQty := g.quantityForPrice(buyPrice, g.cfg.QtyPerOrder)
+			if buyQty > 0 && g.canAddPosition(position.Qty, pendingBuyQty, buyQty, buyPrice, currentPrice) {
+				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, buyQty, buyingPower, openBuyOrders)
 				if placed {
 					buyingPower = newBP
-					pendingBuyQty += g.cfg.QtyPerOrder
+					pendingBuyQty += buyQty
 					openBuyOrders++
 					usedBuyPrices[buyKey] = true
 				}
@@ -1434,7 +1675,7 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 			sellPrice := g.protectedSellPrice(gridSellPrice, position.AvgEntryPrice, currentPrice, level)
 			sellKey := formatLimitPrice(sellPrice, "sell")
 			if !usedSellPrices[sellKey] && !openSellPrices[sellKey] && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
-				qty := math.Min(g.cfg.QtyPerOrder, availableSellQty)
+				qty := math.Min(math.Max(1, g.quantityForPrice(sellPrice, g.cfg.QtyPerOrder)), availableSellQty)
 				if qty > 0 && g.placeSellIfSafe(ctx, level, sellPrice, qty) {
 					availableSellQty -= qty
 					usedSellPrices[sellKey] = true
@@ -1461,19 +1702,24 @@ func (g *GridStrategy) placeSeedBuyIfSafe(ctx context.Context, price, qty, buyin
 		return buyingPower, false
 	}
 
-	_, err := g.client.PlaceOrder(ctx, OrderRequest{
+	clientOrderID := g.clientOrderIDFor(key, "grid-seed")
+	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
 		Side:          "buy",
 		Type:          "limit",
 		TimeInForce:   "day",
 		LimitPrice:    priceKey,
-		ClientOrderID: fmt.Sprintf("grid-seed-%s-%d", strings.ToLower(g.cfg.Symbol), now.UnixNano()),
+		ClientOrderID: clientOrderID,
 	})
 	if err != nil {
+		if isDefinitiveSubmitError(err) {
+			g.clearOrderIntent(key)
+		}
 		log.Printf("grid %s seed buy failed: price=%s qty=%.6f error=%v", g.cfg.Symbol, priceKey, qty, err)
 		return buyingPower, false
 	}
+	g.clearOrderIntent(key)
 	g.pendingOrders[key] = now
 	g.reserveBuyOrder(now, notional)
 	return buyingPower - notional, true
@@ -1495,19 +1741,24 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 		return buyingPower, false
 	}
 
-	_, err := g.client.PlaceOrder(ctx, OrderRequest{
+	clientOrderID := g.clientOrderIDFor(key, fmt.Sprintf("grid-buy-%d", level))
+	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
 		Side:          "buy",
 		Type:          "limit",
 		TimeInForce:   "day",
 		LimitPrice:    priceKey,
-		ClientOrderID: fmt.Sprintf("grid-buy-%s-%d-%s-%d", strings.ToLower(g.cfg.Symbol), level, priceKey, now.UnixNano()),
+		ClientOrderID: clientOrderID,
 	})
 	if err != nil {
+		if isDefinitiveSubmitError(err) {
+			g.clearOrderIntent(key)
+		}
 		log.Printf("grid %s buy order failed: level=%d price=%s qty=%.6f error=%v", g.cfg.Symbol, level, priceKey, qty, err)
 		return buyingPower, false
 	}
+	g.clearOrderIntent(key)
 	g.pendingOrders[key] = now
 	g.reserveBuyOrder(now, notional)
 	return buyingPower - notional, true
@@ -1521,21 +1772,39 @@ func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qt
 		return false
 	}
 
-	_, err := g.client.PlaceOrder(ctx, OrderRequest{
+	clientOrderID := g.clientOrderIDFor(key, fmt.Sprintf("grid-sell-%d", level))
+	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
 		Side:          "sell",
 		Type:          "limit",
 		TimeInForce:   "day",
 		LimitPrice:    priceKey,
-		ClientOrderID: fmt.Sprintf("grid-sell-%s-%d-%s-%d", strings.ToLower(g.cfg.Symbol), level, priceKey, now.UnixNano()),
+		ClientOrderID: clientOrderID,
 	})
 	if err != nil {
+		if isDefinitiveSubmitError(err) {
+			g.clearOrderIntent(key)
+		}
 		log.Printf("grid %s sell order failed: level=%d price=%s qty=%.6f error=%v", g.cfg.Symbol, level, priceKey, qty, err)
 		return false
 	}
+	g.clearOrderIntent(key)
 	g.pendingOrders[key] = now
 	return true
+}
+
+func isDefinitiveSubmitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, status := range []string{"status=400", "status=401", "status=403", "status=404", "status=422"} {
+		if strings.Contains(message, status) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *GridStrategy) isPending(key string) bool {
@@ -1965,11 +2234,13 @@ type OpenCloseConfig struct {
 
 type OpenCloseStrategy struct {
 	BaseStrategy
-	cfg           OpenCloseConfig
-	lastBuyDate   string
-	lastSellDate  string
-	pendingBuyID  string
-	pendingSellID string
+	cfg                 OpenCloseConfig
+	lastBuyDate         string
+	lastSellDate        string
+	pendingBuyID        string
+	pendingSellID       string
+	pendingBuyClientID  string
+	pendingSellClientID string
 }
 
 func NewOpenCloseStrategy(client *AlpacaClient, cfg OpenCloseConfig) *OpenCloseStrategy {
@@ -2069,17 +2340,23 @@ func (s *OpenCloseStrategy) executeSellBeforeOpen(ctx context.Context, dateStr s
 		return nil
 	}
 
-	out, err := s.client.PlaceOrder(ctx, OrderRequest{
+	if s.pendingSellClientID == "" {
+		s.pendingSellClientID = fmt.Sprintf("open-sell-%s-%d", strings.ToLower(s.cfg.Symbol), time.Now().UnixNano())
+	}
+	out, err := s.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        s.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", sellQty),
 		Side:          "sell",
 		Type:          "market",
 		TimeInForce:   "day",
 		ExtendedHours: false,
-		ClientOrderID: fmt.Sprintf("open-sell-%s-%d", s.cfg.Symbol, time.Now().UnixNano()),
+		ClientOrderID: s.pendingSellClientID,
 	})
 	if err == nil {
 		s.pendingSellID = out.ID
+		s.pendingSellClientID = ""
+	} else if isDefinitiveSubmitError(err) {
+		s.pendingSellClientID = ""
 	}
 	return err
 }
@@ -2105,17 +2382,23 @@ func (s *OpenCloseStrategy) executeBuyBeforeClose(ctx context.Context, acct *Acc
 		return errors.New("open-close: insufficient buying power")
 	}
 
-	out, err := s.client.PlaceOrder(ctx, OrderRequest{
+	if s.pendingBuyClientID == "" {
+		s.pendingBuyClientID = fmt.Sprintf("close-buy-%s-%d", strings.ToLower(s.cfg.Symbol), time.Now().UnixNano())
+	}
+	out, err := s.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        s.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", s.cfg.Qty),
 		Side:          "buy",
 		Type:          "market",
 		TimeInForce:   "day",
 		ExtendedHours: false,
-		ClientOrderID: fmt.Sprintf("close-buy-%s-%d", s.cfg.Symbol, time.Now().UnixNano()),
+		ClientOrderID: s.pendingBuyClientID,
 	})
 	if err == nil {
 		s.pendingBuyID = out.ID
+		s.pendingBuyClientID = ""
+	} else if isDefinitiveSubmitError(err) {
+		s.pendingBuyClientID = ""
 	}
 	return err
 }
@@ -2200,10 +2483,10 @@ func currentPositionState(ctx context.Context, client *AlpacaClient, symbol stri
 		CurrentPrice:  parseFloatString(pos.CurrentPrice),
 		Side:          strings.ToLower(strings.TrimSpace(pos.Side)),
 	}
-	if state.CurrentPrice <= 0 && state.Qty > 0 {
+	if state.CurrentPrice <= 0 && math.Abs(state.Qty) > 0 {
 		mv := parseFloatString(pos.MarketValue)
-		if mv > 0 {
-			state.CurrentPrice = mv / state.Qty
+		if math.Abs(mv) > 0 {
+			state.CurrentPrice = math.Abs(mv / state.Qty)
 		}
 	}
 	return state, nil
@@ -2286,6 +2569,8 @@ type Bot struct {
 	stopFunc          context.CancelFunc
 	runCtx            context.Context
 	useWebSockets     bool
+	riskConfig        RiskConfig
+	riskState         RiskState
 }
 
 func NewBot(client *AlpacaClient, interval time.Duration) *Bot {
@@ -2305,6 +2590,55 @@ func NewBot(client *AlpacaClient, interval time.Duration) *Bot {
 		strategyStats:    map[string]*StrategyStats{},
 		strategyLedgers:  map[string]*strategyLedger{},
 		useWebSockets:    true,
+		riskConfig:       LoadRiskConfig(),
+	}
+}
+
+func (b *Bot) SetRiskConfig(cfg RiskConfig) {
+	b.mu.Lock()
+	b.riskConfig = cfg
+	b.mu.Unlock()
+}
+
+func (b *Bot) loadRiskState() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	path := strings.TrimSpace(b.riskConfig.StateFile)
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("risk state read failed: %v", err)
+		}
+		return
+	}
+	var state RiskState
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("risk state decode failed: %v", err)
+		return
+	}
+	b.riskState = state
+}
+
+func (b *Bot) persistRiskStateLocked() {
+	path := strings.TrimSpace(b.riskConfig.StateFile)
+	if path == "" {
+		return
+	}
+	data, err := json.MarshalIndent(b.riskState, "", "  ")
+	if err != nil {
+		log.Printf("risk state encode failed: %v", err)
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("risk state write failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("risk state replace failed: %v", err)
 	}
 }
 
@@ -2366,9 +2700,11 @@ func (b *Bot) runOnce(ctx context.Context) {
 		livePrices[normalized] = price
 	}
 	positionsFetched := false
+	rawPositions := make([]Position, 0)
 	livePositions := make(map[string]HoldingSummary)
 	if positions, err := b.client.GetPositions(ctx); err == nil {
 		positionsFetched = true
+		rawPositions = positions
 		for _, p := range positions {
 			sum := positionToHoldingSummary(p)
 			key := strings.ToUpper(strings.TrimSpace(sum.Symbol))
@@ -2393,6 +2729,23 @@ func (b *Bot) runOnce(ctx context.Context) {
 		b.logError("system", "fetch account failed: "+err.Error())
 		return
 	}
+	if !positionsFetched {
+		return
+	}
+	openOrders, err := b.client.ListOrders(ctx, "open")
+	if err != nil {
+		b.logError("risk", "fetch open orders failed; refusing new orders: "+err.Error())
+		return
+	}
+	allowed, newlyHalted, riskReason := b.evaluateAccountRisk(acct, rawPositions, openOrders)
+	if !allowed {
+		if newlyHalted {
+			b.logError("risk", riskReason)
+			b.enforceRiskHalt(ctx, riskReason)
+		}
+		b.recordSnapshotFromAccount(acct)
+		return
+	}
 	b.recordSnapshotFromAccount(acct)
 	clock, err := b.client.GetClock(ctx)
 	if err != nil {
@@ -2406,8 +2759,181 @@ func (b *Bot) runOnce(ctx context.Context) {
 	}
 	b.mu.RUnlock()
 	for _, s := range strategies {
-		if err := s.Tick(ctx, acct, clock); err != nil {
+		spendable := b.accountForStrategy(acct, s.Symbol(), rawPositions, openOrders)
+		if err := s.Tick(ctx, spendable, clock); err != nil {
 			b.logError(s.Name(), err.Error())
+		}
+		// Refresh after every strategy so later strategies cannot all spend the
+		// same stale cash/buying-power snapshot in one cycle.
+		if refreshed, refreshErr := b.client.GetAccount(ctx); refreshErr == nil {
+			acct = refreshed
+		} else if ctx.Err() == nil {
+			b.logError("system", "post-strategy account refresh failed: "+refreshErr.Error())
+			return
+		}
+		refreshedPositions, positionsErr := b.client.GetPositions(ctx)
+		refreshedOrders, ordersErr := b.client.ListOrders(ctx, "open")
+		if positionsErr != nil || ordersErr != nil {
+			b.logError("risk", fmt.Sprintf("post-strategy exposure refresh failed; refusing further orders: positions=%v orders=%v", positionsErr, ordersErr))
+			return
+		}
+		rawPositions = refreshedPositions
+		openOrders = refreshedOrders
+		allowed, newlyHalted, riskReason = b.evaluateAccountRisk(acct, rawPositions, openOrders)
+		if !allowed {
+			if newlyHalted {
+				b.logError("risk", riskReason)
+				b.enforceRiskHalt(ctx, riskReason)
+			}
+			return
+		}
+	}
+}
+
+func (b *Bot) accountForStrategy(acct *Account, symbol string, positions []Position, openOrders []Order) *Account {
+	if acct == nil {
+		return &Account{}
+	}
+	copyAccount := *acct
+	b.mu.RLock()
+	cashOnly := b.riskConfig.CashOnly
+	riskConfig := b.riskConfig
+	b.mu.RUnlock()
+	available := math.Max(0, parseFloatString(acct.BuyingPower))
+	if cashOnly {
+		available = math.Min(available, math.Max(0, parseFloatString(acct.Cash)))
+		if strings.TrimSpace(acct.NonMarginableBuyingPower) != "" {
+			available = math.Min(available, math.Max(0, parseFloatString(acct.NonMarginableBuyingPower)))
+		}
+	}
+
+	// Reserve both filled exposure and live buy orders before handing a budget to
+	// a strategy. This prevents multiple strategies from all spending the same
+	// account-level capacity during one scheduler cycle.
+	equity := parseFloatString(acct.Equity)
+	grossExposure, symbolExposure := calculateRiskExposure(positions, openOrders)
+	if equity > 0 && riskConfig.MaxGrossExposurePct > 0 {
+		grossRemaining := math.Max(0, equity*riskConfig.MaxGrossExposurePct-grossExposure)
+		available = math.Min(available, grossRemaining)
+	}
+	if equity > 0 && riskConfig.MaxSymbolExposurePct > 0 {
+		symbolKey := strings.ToUpper(strings.TrimSpace(symbol))
+		symbolRemaining := math.Max(0, equity*riskConfig.MaxSymbolExposurePct-symbolExposure[symbolKey])
+		available = math.Min(available, symbolRemaining)
+	}
+	copyAccount.BuyingPower = strconv.FormatFloat(available, 'f', 2, 64)
+	return &copyAccount
+}
+
+func calculateRiskExposure(positions []Position, openOrders []Order) (float64, map[string]float64) {
+	bySymbol := make(map[string]float64)
+	for _, position := range positions {
+		symbol := strings.ToUpper(strings.TrimSpace(position.Symbol))
+		marketValue := math.Abs(parseFloatString(position.MarketValue))
+		bySymbol[symbol] += marketValue
+	}
+	for _, order := range openOrders {
+		if !strings.EqualFold(order.Side, "buy") || !isActiveOrderStatus(order.Status) {
+			continue
+		}
+		price := parseFloatString(order.LimitPrice)
+		if price <= 0 {
+			price = parseFloatString(order.FilledAvgPrice)
+		}
+		reserved := remainingOrderQty(order) * price
+		if reserved <= 0 {
+			continue
+		}
+		symbol := strings.ToUpper(strings.TrimSpace(order.Symbol))
+		bySymbol[symbol] += reserved
+	}
+	gross := 0.0
+	for _, exposure := range bySymbol {
+		gross += exposure
+	}
+	return gross, bySymbol
+}
+
+func (b *Bot) evaluateAccountRisk(acct *Account, positions []Position, openOrders []Order) (allowed, newlyHalted bool, reason string) {
+	if acct == nil {
+		return false, false, "account unavailable"
+	}
+	now := time.Now().UTC()
+	day, _, _ := tradingDayBounds(now)
+	equity := parseFloatString(acct.Equity)
+	if equity <= 0 {
+		return false, false, "account equity is not positive"
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.riskState.Halted {
+		return false, false, b.riskState.Reason
+	}
+	if b.riskState.SessionDay != day || b.riskState.SessionEquity <= 0 {
+		b.riskState.SessionDay = day
+		b.riskState.SessionEquity = equity
+	}
+	if b.riskState.HighWaterEquity <= 0 || equity > b.riskState.HighWaterEquity {
+		b.riskState.HighWaterEquity = equity
+	}
+
+	dailyLossPct := math.Max(0, (b.riskState.SessionEquity-equity)/b.riskState.SessionEquity)
+	drawdownPct := math.Max(0, (b.riskState.HighWaterEquity-equity)/b.riskState.HighWaterEquity)
+	grossExposure, exposureBySymbol := calculateRiskExposure(positions, openOrders)
+	maxSymbolExposure := 0.0
+	maxSymbol := ""
+	for symbol, exposure := range exposureBySymbol {
+		if exposure > maxSymbolExposure {
+			maxSymbolExposure = exposure
+			maxSymbol = symbol
+		}
+	}
+	grossExposurePct := grossExposure / equity
+	maxSymbolExposurePct := maxSymbolExposure / equity
+
+	b.riskState.DailyLossPct = dailyLossPct
+	b.riskState.DrawdownPct = drawdownPct
+	b.riskState.GrossExposurePct = grossExposurePct
+	b.riskState.UpdatedAt = now.Format(time.RFC3339)
+
+	switch {
+	case acct.AccountBlocked:
+		reason = "broker account is blocked"
+	case acct.TradingBlocked:
+		reason = "broker trading is blocked"
+	case acct.TradeSuspendedByUser:
+		reason = "trading is suspended by user"
+	case b.riskConfig.MaxDailyLossPct > 0 && dailyLossPct >= b.riskConfig.MaxDailyLossPct:
+		reason = fmt.Sprintf("daily loss %.2f%% reached limit %.2f%%", dailyLossPct*100, b.riskConfig.MaxDailyLossPct*100)
+	case b.riskConfig.MaxDrawdownPct > 0 && drawdownPct >= b.riskConfig.MaxDrawdownPct:
+		reason = fmt.Sprintf("drawdown %.2f%% reached limit %.2f%%", drawdownPct*100, b.riskConfig.MaxDrawdownPct*100)
+	case b.riskConfig.MaxGrossExposurePct > 0 && grossExposurePct > b.riskConfig.MaxGrossExposurePct:
+		reason = fmt.Sprintf("gross exposure %.2f%% exceeds limit %.2f%%", grossExposurePct*100, b.riskConfig.MaxGrossExposurePct*100)
+	case b.riskConfig.MaxSymbolExposurePct > 0 && maxSymbolExposurePct > b.riskConfig.MaxSymbolExposurePct:
+		reason = fmt.Sprintf("%s exposure %.2f%% exceeds limit %.2f%%", maxSymbol, maxSymbolExposurePct*100, b.riskConfig.MaxSymbolExposurePct*100)
+	}
+	if reason == "" {
+		b.persistRiskStateLocked()
+		return true, false, ""
+	}
+	b.riskState.Halted = true
+	b.riskState.Reason = reason
+	b.persistRiskStateLocked()
+	return false, true, reason
+}
+
+func (b *Bot) enforceRiskHalt(ctx context.Context, reason string) {
+	log.Printf("RISK HALT: %s", reason)
+	if _, err := b.client.CancelAllOrders(ctx); err != nil {
+		b.logError("risk", "cancel all orders failed: "+err.Error())
+	}
+	b.mu.RLock()
+	liquidate := b.riskConfig.LiquidateOnRiskHalt
+	b.mu.RUnlock()
+	if liquidate {
+		if _, err := b.client.CloseAllPositions(ctx); err != nil {
+			b.logError("risk", "close all positions failed: "+err.Error())
 		}
 	}
 }
@@ -2901,7 +3427,57 @@ func (c *AlpacaClient) CloseStreams() {
 		c.tradingCancel()
 		c.tradingCancel = nil
 	}
+	marketConn := c.marketConn
+	tradingConn := c.tradingConn
+	c.marketConn = nil
+	c.tradingConn = nil
 	c.wsMu.Unlock()
+	// Closing the sockets is required: canceling context alone does not unblock
+	// gorilla/websocket ReadMessage while the connection is idle.
+	if marketConn != nil {
+		_ = marketConn.Close()
+	}
+	if tradingConn != nil {
+		_ = tradingConn.Close()
+	}
+}
+
+func (c *AlpacaClient) registerMarketConn(ctx context.Context, conn *websocket.Conn) bool {
+	c.wsMu.Lock()
+	defer c.wsMu.Unlock()
+	if ctx.Err() != nil || c.marketCancel == nil {
+		return false
+	}
+	c.marketConn = conn
+	return true
+}
+
+func (c *AlpacaClient) releaseMarketConn(conn *websocket.Conn) {
+	c.wsMu.Lock()
+	if c.marketConn == conn {
+		c.marketConn = nil
+	}
+	c.wsMu.Unlock()
+	_ = conn.Close()
+}
+
+func (c *AlpacaClient) registerTradingConn(ctx context.Context, conn *websocket.Conn) bool {
+	c.wsMu.Lock()
+	defer c.wsMu.Unlock()
+	if ctx.Err() != nil || c.tradingCancel == nil {
+		return false
+	}
+	c.tradingConn = conn
+	return true
+}
+
+func (c *AlpacaClient) releaseTradingConn(conn *websocket.Conn) {
+	c.wsMu.Lock()
+	if c.tradingConn == conn {
+		c.tradingConn = nil
+	}
+	c.wsMu.Unlock()
+	_ = conn.Close()
 }
 
 func (c *AlpacaClient) StartMarketDataStream(ctx context.Context, symbols []string) {
@@ -3055,6 +3631,10 @@ func (c *AlpacaClient) runMarketStream(ctx context.Context, symbols []string) {
 			}
 			continue
 		}
+		if !c.registerMarketConn(ctx, conn) {
+			_ = conn.Close()
+			return
+		}
 
 		log.Printf("market websocket connected: url=%s", c.marketStreamURL())
 		backoff = 2 * time.Second
@@ -3064,7 +3644,7 @@ func (c *AlpacaClient) runMarketStream(ctx context.Context, symbols []string) {
 			"key":    c.apiKey,
 			"secret": c.secret,
 		}); err != nil {
-			_ = conn.Close()
+			c.releaseMarketConn(conn)
 			log.Printf("market websocket auth write failed: %v", err)
 			if !sleepWithContext(ctx, backoff) {
 				return
@@ -3074,7 +3654,7 @@ func (c *AlpacaClient) runMarketStream(ctx context.Context, symbols []string) {
 
 		subs := normalizeSymbols(symbols)
 		if len(subs) == 0 {
-			_ = conn.Close()
+			c.releaseMarketConn(conn)
 			log.Printf("market websocket has no valid symbols; stream stopped")
 			return
 		}
@@ -3089,7 +3669,7 @@ func (c *AlpacaClient) runMarketStream(ctx context.Context, symbols []string) {
 		}
 		log.Printf("market websocket subscribe: symbols=%v", subs)
 		if err := conn.WriteJSON(sub); err != nil {
-			_ = conn.Close()
+			c.releaseMarketConn(conn)
 			log.Printf("market websocket subscribe write failed: %v", err)
 			if !sleepWithContext(ctx, backoff) {
 				return
@@ -3098,7 +3678,7 @@ func (c *AlpacaClient) runMarketStream(ctx context.Context, symbols []string) {
 		}
 
 		readErr := c.readMarketLoop(ctx, conn)
-		_ = conn.Close()
+		c.releaseMarketConn(conn)
 		if ctx.Err() != nil {
 			return
 		}
@@ -3297,6 +3877,10 @@ func (c *AlpacaClient) runTradingStream(ctx context.Context, onUpdate func(Trade
 			}
 			continue
 		}
+		if !c.registerTradingConn(ctx, conn) {
+			_ = conn.Close()
+			return
+		}
 		backoff = 2 * time.Second
 
 		if err := conn.WriteJSON(map[string]any{
@@ -3304,7 +3888,7 @@ func (c *AlpacaClient) runTradingStream(ctx context.Context, onUpdate func(Trade
 			"key":    c.apiKey,
 			"secret": c.secret,
 		}); err != nil {
-			_ = conn.Close()
+			c.releaseTradingConn(conn)
 			log.Printf("trading websocket auth write failed: %v", err)
 			if !sleepWithContext(ctx, backoff) {
 				return
@@ -3317,7 +3901,7 @@ func (c *AlpacaClient) runTradingStream(ctx context.Context, onUpdate func(Trade
 				"streams": []string{"trade_updates"},
 			},
 		}); err != nil {
-			_ = conn.Close()
+			c.releaseTradingConn(conn)
 			log.Printf("trading websocket listen write failed: %v", err)
 			if !sleepWithContext(ctx, backoff) {
 				return
@@ -3326,7 +3910,7 @@ func (c *AlpacaClient) runTradingStream(ctx context.Context, onUpdate func(Trade
 		}
 
 		readErr := c.readTradingLoop(ctx, conn, onUpdate)
-		_ = conn.Close()
+		c.releaseTradingConn(conn)
 		if ctx.Err() != nil {
 			return
 		}
@@ -3569,13 +4153,19 @@ func (b *Bot) TotalAssets(ctx context.Context) (map[string]any, error) {
 	longMV := parseFloatString(acct.LongMarketValue)
 	shortMV := parseFloatString(acct.ShortMarketValue)
 	return map[string]any{
-		"id":                 strings.TrimSpace(acct.ID),
-		"status":             strings.TrimSpace(acct.Status),
-		"equity":             parseFloatString(acct.Equity),
-		"cash":               parseFloatString(acct.Cash),
-		"buying_power":       parseFloatString(acct.BuyingPower),
-		"long_market_value":  longMV,
-		"short_market_value": shortMV,
+		"id":                          strings.TrimSpace(acct.ID),
+		"status":                      strings.TrimSpace(acct.Status),
+		"trading_mode":                b.client.TradingMode(),
+		"equity":                      parseFloatString(acct.Equity),
+		"cash":                        parseFloatString(acct.Cash),
+		"buying_power":                parseFloatString(acct.BuyingPower),
+		"non_marginable_buying_power": parseFloatString(acct.NonMarginableBuyingPower),
+		"long_market_value":           longMV,
+		"short_market_value":          shortMV,
+		"maintenance_margin":          parseFloatString(acct.MaintenanceMargin),
+		"trading_blocked":             acct.TradingBlocked,
+		"account_blocked":             acct.AccountBlocked,
+		"trade_suspended_by_user":     acct.TradeSuspendedByUser,
 	}, nil
 }
 
@@ -3667,11 +4257,11 @@ func (b *Bot) Performance(ctx context.Context) (PerformanceSummary, error) {
 		avg := parseFloatString(p.AvgEntryPrice)
 		cur := parseFloatString(p.CurrentPrice)
 		side := strings.ToLower(strings.TrimSpace(p.Side))
-		if qty <= 0 || avg <= 0 || cur <= 0 {
+		if math.Abs(qty) <= 0 || avg <= 0 || cur <= 0 {
 			continue
 		}
 		if side == "short" {
-			unrealized += qty * (avg - cur)
+			unrealized += math.Abs(qty) * (avg - cur)
 		} else {
 			unrealized += qty * (cur - avg)
 		}
@@ -3723,12 +4313,27 @@ func (b *Bot) Status() map[string]any {
 	startedAt := b.startAt
 	raw := make([]TradeRecord, len(b.tradeRecords))
 	copy(raw, b.tradeRecords)
+	riskState := b.riskState
+	riskConfig := b.riskConfig
+	running := b.isRunning
 	b.mu.RUnlock()
 	sort.Strings(strats)
 	return map[string]any{
-		"started_at":  startedAt,
-		"strategies":  strats,
-		"trade_count": len(aggregateTradeRecords(raw)),
+		"started_at":   startedAt,
+		"running":      running,
+		"build":        processBuildVersion,
+		"trading_mode": b.client.TradingMode(),
+		"strategies":   strats,
+		"trade_count":  len(aggregateTradeRecords(raw)),
+		"risk":         riskState,
+		"risk_config": map[string]any{
+			"cash_only":               riskConfig.CashOnly,
+			"max_daily_loss_pct":      riskConfig.MaxDailyLossPct,
+			"max_drawdown_pct":        riskConfig.MaxDrawdownPct,
+			"max_gross_exposure_pct":  riskConfig.MaxGrossExposurePct,
+			"max_symbol_exposure_pct": riskConfig.MaxSymbolExposurePct,
+			"liquidate_on_risk_halt":  riskConfig.LiquidateOnRiskHalt,
+		},
 	}
 }
 
@@ -3911,6 +4516,7 @@ func (b *Bot) prewarmReferencePrices(ctx context.Context) {
 
 func (b *Bot) Start(ctx context.Context) error {
 	log.Printf("process build version: %s", processBuildVersion)
+	b.loadRiskState()
 	b.mu.Lock()
 	if b.isRunning {
 		b.mu.Unlock()
@@ -3971,13 +4577,13 @@ func (b *Bot) Start(ctx context.Context) error {
 
 func (b *Bot) Stop() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.stopFunc != nil {
 		b.stopFunc()
 		b.stopFunc = nil
 	}
-	b.client.CloseStreams()
 	b.isRunning = false
+	b.mu.Unlock()
+	b.client.CloseStreams()
 }
 
 func (b *Bot) IsRunning() bool {
@@ -3988,42 +4594,83 @@ func (b *Bot) IsRunning() bool {
 
 func (b *Bot) Restart(ctx context.Context) error {
 	b.Stop()
-	b.wg.Wait()
+	if !b.waitStopped(10 * time.Second) {
+		return errors.New("bot restart aborted: previous workers did not stop within 10s")
+	}
 	return b.Start(ctx)
+}
+
+func (b *Bot) waitStopped(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (b *Bot) LiquidateAll(ctx context.Context) error {
 	log.Println("正在停止机器人策略轮询...")
 	b.Stop()
-	b.wg.Wait()
-	if err := b.client.CloseAllPositions(ctx); err != nil {
-		return fmt.Errorf("一键清仓接口调用失败: %w", err)
+	if !b.waitStopped(5 * time.Second) {
+		log.Printf("workers did not fully stop within 5s; continuing emergency broker cancellation")
 	}
-	deadline := time.After(15 * time.Second)
+	if _, err := b.client.CancelAllOrders(ctx); err != nil {
+		log.Printf("emergency cancel-all warning: %v", err)
+	}
+	if _, err := b.client.CloseAllPositions(ctx); err != nil {
+		log.Printf("emergency close-all warning: %v", err)
+	}
+	deadline := time.NewTimer(25 * time.Second)
+	defer deadline.Stop()
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
+	var lastPositionErr, lastOrderErr error
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-deadline:
-			remaining, err := b.client.GetPositions(ctx)
-			if err == nil && len(remaining) > 0 {
-				syms := make([]string, 0, len(remaining))
-				for _, p := range remaining {
-					syms = append(syms, p.Symbol)
-				}
-				return fmt.Errorf("一键平仓指令下发成功，但 15s 内未完全成交，残留持仓标的: %v", syms)
+		case <-deadline.C:
+			positions, posErr := b.client.GetPositions(ctx)
+			orders, orderErr := b.client.ListOrders(ctx, "open")
+			if posErr != nil || orderErr != nil {
+				return fmt.Errorf("liquidation verification failed: positions=%v orders=%v", posErr, orderErr)
 			}
-			log.Println("一键清仓完毕（超时校验通过，无残留仓位）。")
-			return nil
+			positionSymbols := make([]string, 0, len(positions))
+			for _, position := range positions {
+				positionSymbols = append(positionSymbols, position.Symbol)
+			}
+			orderIDs := make([]string, 0, len(orders))
+			for _, order := range orders {
+				orderIDs = append(orderIDs, order.ID)
+			}
+			return fmt.Errorf("liquidation incomplete after 25s: positions=%v open_orders=%v last_errors=(%v, %v)", positionSymbols, orderIDs, lastPositionErr, lastOrderErr)
 		case <-tick.C:
-			remaining, err := b.client.GetPositions(ctx)
-			if err == nil && len(remaining) == 0 {
-				log.Println(" 仓位已成功归零，平仓完毕。")
+			positions, posErr := b.client.GetPositions(ctx)
+			orders, orderErr := b.client.ListOrders(ctx, "open")
+			lastPositionErr, lastOrderErr = posErr, orderErr
+			if posErr == nil && orderErr == nil && len(positions) == 0 && len(orders) == 0 {
+				log.Println("仓位和挂单均已归零，平仓完毕。")
 				return nil
 			}
-			log.Println("正在等待仓位清空成交中...")
+			if orderErr == nil && len(orders) > 0 {
+				_, _ = b.client.CancelAllOrders(ctx)
+			}
+			if posErr == nil && len(positions) > 0 {
+				_, _ = b.client.CloseAllPositions(ctx)
+			}
+			log.Printf("waiting for liquidation: positions=%d open_orders=%d", len(positions), len(orders))
 		}
 	}
 }

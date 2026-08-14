@@ -326,13 +326,14 @@
                                 <span class="runtime-indicator__dot"></span>
                             </span>
                             <span class="runtime-indicator__label">
-                                {{ dashboard.account.status === 'running' ? '运行中' : '已停止' }}
+                                {{ String(dashboard.account.trading_mode || 'paper').toUpperCase() }} · {{ dashboard.account.status === 'running' ? '运行中' : '已停止' }}
                             </span>
                         </div>
                         <button @click="liquidateAll" class="btn btn--danger" :disabled="liquidating || !authPassed">
                             {{ liquidating ? '平仓中...' : '一键平仓' }}
                         </button>
-                        <button @click="restartBot" class="btn btn--primary" :disabled="restarting || !authPassed">
+                        <button @click="restartBot" class="btn btn--primary" :disabled="restarting || !authPassed || dashboard.status.risk.halted"
+                                :title="dashboard.status.risk.halted ? '风控已熔断，需人工复核状态文件和账户后再解除' : ''">
                             {{ restarting ? '重启中...' : '重启机器人' }}
                         </button>
                         <button @click="loadDashboard" class="btn btn--ghost" :disabled="!authPassed">刷新数据</button>
@@ -342,6 +343,19 @@
         </header>
 
         <main class="flex-1 pb-14">
+            <section v-if="dashboard.account.trading_mode === 'live' || dashboard.status.risk.halted || dashboard.account.trading_blocked || dashboard.account.account_blocked || dashboard.account.trade_suspended_by_user"
+                     class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-5">
+                <div class="rounded-2xl border px-5 py-4"
+                     :class="dashboard.status.risk.halted || dashboard.account.trading_blocked || dashboard.account.account_blocked || dashboard.account.trade_suspended_by_user ? 'bg-rose-50 border-rose-200 text-rose-800' : 'bg-amber-50 border-amber-200 text-amber-800'">
+                    <div class="font-extrabold">
+                        {{ dashboard.status.risk.halted ? '账户级风控已熔断' : (dashboard.account.trading_mode === 'live' ? '当前连接真实资金账户' : '券商账户限制') }}
+                    </div>
+                    <div class="mt-1 text-sm">
+                        {{ dashboard.status.risk.reason || (dashboard.account.trading_mode === 'live' ? '真实订单会产生实际盈亏，请先完成模拟盘与小资金验证。' : '券商已限制账户交易，请检查账户状态。') }}
+                    </div>
+                </div>
+            </section>
+
             <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6">
                 <div class="grid lg:grid-cols-[1.5fr_1fr] gap-5">
                     <div class="glass panel hero-card shadow-soft p-5 sm:p-7">
@@ -377,6 +391,15 @@
                             <div class="flex justify-between border-b pb-3">
                                 <span class="text-sm text-slate-500">购买力</span>
                                 <span class="font-semibold text-slate-900">{{ formatCurrency(dashboard.account.buying_power) }}</span>
+                            </div>
+                            <div class="flex justify-between border-b pb-3">
+                                <span class="text-sm text-slate-500">不可融资购买力</span>
+                                <span class="font-semibold text-slate-900">{{ formatCurrency(dashboard.account.non_marginable_buying_power) }}</span>
+                            </div>
+                            <div class="grid grid-cols-3 gap-2 text-center border-b pb-3">
+                                <div><div class="text-[10px] text-slate-500">日内亏损</div><div class="text-xs font-bold">{{ formatRiskPct(dashboard.status.risk.daily_loss_pct) }}</div></div>
+                                <div><div class="text-[10px] text-slate-500">回撤</div><div class="text-xs font-bold">{{ formatRiskPct(dashboard.status.risk.drawdown_pct) }}</div></div>
+                                <div><div class="text-[10px] text-slate-500">总敞口</div><div class="text-xs font-bold">{{ formatRiskPct(dashboard.status.risk.gross_exposure_pct) }}</div></div>
                             </div>
                             <div class="flex justify-between">
                                 <span class="text-sm text-slate-500">数据更新</span>
@@ -671,8 +694,14 @@
                     computed_equity: 0,
                     cash: 0,
                     buying_power: 0,
+                    non_marginable_buying_power: 0,
                     long_market_value: 0,
-                    short_market_value: 0
+                    short_market_value: 0,
+                    maintenance_margin: 0,
+                    trading_mode: 'paper',
+                    trading_blocked: false,
+                    account_blocked: false,
+                    trade_suspended_by_user: false
                 };
 
                 const createEmptyDashboard = () => ({
@@ -684,6 +713,12 @@
                     positions: [],
                     strategies: [],
                     latest_prices: {},
+                    status: {
+                        running: false,
+                        trading_mode: 'paper',
+                        risk: { halted: false, reason: '', daily_loss_pct: 0, drawdown_pct: 0, gross_exposure_pct: 0 },
+                        risk_config: {}
+                    },
                     meta: {},
                     snapshots: [],
                     errors: [],
@@ -738,6 +773,7 @@
                     const n = finiteNumber(v);
                     return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
                 };
+                const formatRiskPct = (v) => (finiteNumber(v) * 100).toFixed(2) + '%';
                 const colorClass = (v) => finiteNumber(v) >= 0 ? 'text-emerald-600' : 'text-rose-600';
 
                 const positionDirection = (p) => {
@@ -958,6 +994,14 @@
                         };
                         dashboard.value.positions = Array.isArray(data.positions) ? data.positions : [];
                         dashboard.value.latest_prices = data.latest_prices || {};
+                        dashboard.value.status = {
+                            ...createEmptyDashboard().status,
+                            ...(data.status || {}),
+                            risk: {
+                                ...createEmptyDashboard().status.risk,
+                                ...((data.status && data.status.risk) || {})
+                            }
+                        };
                         dashboard.value.meta = data.meta || {};
                         dashboard.value.snapshots = Array.isArray(data.snapshots) ? data.snapshots : [];
                         dashboard.value.errors = Array.isArray(data.errors) ? data.errors : [];
@@ -1306,6 +1350,7 @@
                     formatCurrency,
                     formatSignedCurrency,
                     formatSignedPercent,
+                    formatRiskPct,
                     colorClass,
                     positionDirection,
                     positionSideClass,

@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,15 +61,21 @@ type DashboardResponse struct {
 }
 
 type AccountView struct {
-	ID               string  `json:"id"`
-	Status           string  `json:"status"`
-	BrokerStatus     string  `json:"broker_status"`
-	Equity           float64 `json:"equity"`
-	ComputedEquity   float64 `json:"computed_equity"`
-	Cash             float64 `json:"cash"`
-	BuyingPower      float64 `json:"buying_power"`
-	LongMarketValue  float64 `json:"long_market_value"`
-	ShortMarketValue float64 `json:"short_market_value"`
+	ID                       string  `json:"id"`
+	Status                   string  `json:"status"`
+	BrokerStatus             string  `json:"broker_status"`
+	TradingMode              string  `json:"trading_mode"`
+	Equity                   float64 `json:"equity"`
+	ComputedEquity           float64 `json:"computed_equity"`
+	Cash                     float64 `json:"cash"`
+	BuyingPower              float64 `json:"buying_power"`
+	NonMarginableBuyingPower float64 `json:"non_marginable_buying_power"`
+	LongMarketValue          float64 `json:"long_market_value"`
+	ShortMarketValue         float64 `json:"short_market_value"`
+	MaintenanceMargin        float64 `json:"maintenance_margin"`
+	TradingBlocked           bool    `json:"trading_blocked"`
+	AccountBlocked           bool    `json:"account_blocked"`
+	TradeSuspendedByUser     bool    `json:"trade_suspended_by_user"`
 }
 
 type PerformanceView struct {
@@ -334,6 +341,18 @@ func parseFloat(v any) float64 {
 	}
 }
 
+func parseBool(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		parsed, _ := strconv.ParseBool(strings.TrimSpace(x))
+		return parsed
+	default:
+		return false
+	}
+}
+
 func formatAccount(assets map[string]any, running bool) AccountView {
 	status := "stopped"
 	if running {
@@ -343,8 +362,10 @@ func formatAccount(assets map[string]any, running bool) AccountView {
 	equity := parseFloat(assets["equity"])
 	cash := parseFloat(assets["cash"])
 	buyingPower := parseFloat(assets["buying_power"])
+	nonMarginableBuyingPower := parseFloat(assets["non_marginable_buying_power"])
 	longMarketValue := parseFloat(assets["long_market_value"])
 	shortMarketValueRaw := parseFloat(assets["short_market_value"])
+	maintenanceMargin := parseFloat(assets["maintenance_margin"])
 
 	brokerStatus := ""
 	if v, ok := assets["status"]; ok {
@@ -354,6 +375,13 @@ func formatAccount(assets map[string]any, running bool) AccountView {
 	accountID := ""
 	if v, ok := assets["id"]; ok {
 		accountID = strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+
+	tradingMode := "paper"
+	if v, ok := assets["trading_mode"]; ok {
+		if parsed := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v))); parsed == "live" || parsed == "paper" {
+			tradingMode = parsed
+		}
 	}
 
 	signedShort := shortMarketValueRaw
@@ -388,15 +416,21 @@ func formatAccount(assets map[string]any, running bool) AccountView {
 	}
 
 	return AccountView{
-		ID:               accountID,
-		Status:           status,
-		BrokerStatus:     brokerStatus,
-		Equity:           equity,
-		ComputedEquity:   computedEquity,
-		Cash:             cash,
-		BuyingPower:      buyingPower,
-		LongMarketValue:  longMarketValue,
-		ShortMarketValue: signedShort,
+		ID:                       accountID,
+		Status:                   status,
+		BrokerStatus:             brokerStatus,
+		TradingMode:              tradingMode,
+		Equity:                   equity,
+		ComputedEquity:           computedEquity,
+		Cash:                     cash,
+		BuyingPower:              buyingPower,
+		NonMarginableBuyingPower: nonMarginableBuyingPower,
+		LongMarketValue:          longMarketValue,
+		ShortMarketValue:         signedShort,
+		MaintenanceMargin:        maintenanceMargin,
+		TradingBlocked:           parseBool(assets["trading_blocked"]),
+		AccountBlocked:           parseBool(assets["account_blocked"]),
+		TradeSuspendedByUser:     parseBool(assets["trade_suspended_by_user"]),
 	}
 }
 
@@ -1011,6 +1045,8 @@ func defaultGridConfig(symbol string, qtyPerOrder, maxQty float64) process.GridC
 		MaxSpacingPct:         0.06,
 		QtyPerOrder:           qtyPerOrder,
 		SeedQty:               qtyPerOrder,
+		OrderNotional:         250,
+		MaxPositionNotional:   1200,
 		RecenterPct:           0.05,
 		MaxPositionQty:        maxQty,
 		UseTrendFilter:        true,
@@ -1028,7 +1064,7 @@ func defaultGridConfig(symbol string, qtyPerOrder, maxQty float64) process.GridC
 		MACDSignalPeriod:      9,
 		MACDBearishPct:        0.001,
 		MinBearishBuyLevel:    3,
-		DailyBuyNotionalLimit: 1000,
+		DailyBuyNotionalLimit: 1500,
 		BuyCooldown:           2 * time.Minute,
 		RebuildCooldown:       20 * time.Minute,
 		MaxOpenBuyOrders:      3,
@@ -1042,9 +1078,9 @@ func StartTrade() {
 	client := process.NewAlpacaClient(cfg)
 	bot := process.NewBot(client, cfg.Interval)
 
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("CW", 2, 25)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("LEU", 5, 25)))
 	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("MOD", 5, 25)))
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("flnc", 50, 25)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("IONQ", 5, 25)))
 
 	ctx := context.Background()
 	if err := bot.Start(ctx); err != nil {
@@ -1139,7 +1175,10 @@ func LiquidateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// Once an authenticated emergency liquidation is accepted, keep it running
+	// even if the browser disconnects. The broker-side verification has its own
+	// bounded timeout and must not be aborted by a transient client connection.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	if err := bot.LiquidateAll(ctx); err != nil {
