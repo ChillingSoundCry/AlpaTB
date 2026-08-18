@@ -690,8 +690,8 @@ func LoadRiskConfig() RiskConfig {
 		CashOnly:             getenvBool("RISK_CASH_ONLY", true),
 		MaxDailyLossPct:      getenvFloat("RISK_MAX_DAILY_LOSS_PCT", 0.01),
 		MaxDrawdownPct:       getenvFloat("RISK_MAX_DRAWDOWN_PCT", 0.05),
-		MaxGrossExposurePct:  getenvFloat("RISK_MAX_GROSS_EXPOSURE_PCT", 0.35),
-		MaxSymbolExposurePct: getenvFloat("RISK_MAX_SYMBOL_EXPOSURE_PCT", 0.12),
+		MaxGrossExposurePct:  getenvFloat("RISK_MAX_GROSS_EXPOSURE_PCT", 0.75),
+		MaxSymbolExposurePct: getenvFloat("RISK_MAX_SYMBOL_EXPOSURE_PCT", 0.5),
 		LiquidateOnRiskHalt:  getenvBool("RISK_LIQUIDATE_ON_HALT", true),
 		StateFile:            getenvDefault("RISK_STATE_FILE", "bot_risk_state.json"),
 	}
@@ -1497,12 +1497,24 @@ func (g *GridStrategy) canAddPosition(positionQty, pendingQty, addQty, orderPric
 	return true
 }
 
-func (g *GridStrategy) clientOrderIDFor(key, prefix string) string {
-	if intent, ok := g.uncertainIntents[key]; ok && time.Since(intent.CreatedAt) < 10*time.Minute {
+func (g *GridStrategy) clientOrderIDFor(key, kind string, level int) string {
+	if intent, ok := g.uncertainIntents[key]; ok &&
+		time.Since(intent.CreatedAt) < 10*time.Minute {
 		return intent.ClientOrderID
 	}
-	id := fmt.Sprintf("%s-%s-%d", prefix, strings.ToLower(g.cfg.Symbol), time.Now().UnixNano())
-	g.uncertainIntents[key] = orderIntent{ClientOrderID: id, CreatedAt: time.Now()}
+
+	symbol := strings.ToLower(strings.TrimSpace(g.cfg.Symbol))
+	prefix := fmt.Sprintf("grid-%s-%s", kind, symbol)
+
+	if level > 0 {
+		prefix = fmt.Sprintf("%s-%d", prefix, level)
+	}
+
+	id := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	g.uncertainIntents[key] = orderIntent{
+		ClientOrderID: id,
+		CreatedAt:     time.Now(),
+	}
 	return id
 }
 
@@ -1702,7 +1714,7 @@ func (g *GridStrategy) placeSeedBuyIfSafe(ctx context.Context, price, qty, buyin
 		return buyingPower, false
 	}
 
-	clientOrderID := g.clientOrderIDFor(key, "grid-seed")
+	clientOrderID := g.clientOrderIDFor(key, "seed", 0)
 	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
@@ -1741,7 +1753,7 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 		return buyingPower, false
 	}
 
-	clientOrderID := g.clientOrderIDFor(key, fmt.Sprintf("grid-buy-%d", level))
+	clientOrderID := g.clientOrderIDFor(key, "buy", level)
 	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
@@ -1772,7 +1784,7 @@ func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qt
 		return false
 	}
 
-	clientOrderID := g.clientOrderIDFor(key, fmt.Sprintf("grid-sell-%d", level))
+	clientOrderID := g.clientOrderIDFor(key, "sell", level)
 	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
@@ -2419,9 +2431,19 @@ func isGridOrderForSymbol(order Order, symbol string) bool {
 	}
 	id := strings.ToLower(strings.TrimSpace(order.ClientOrderID))
 	sym := strings.ToLower(strings.TrimSpace(symbol))
-	return strings.HasPrefix(id, "grid-buy-"+sym+"-") ||
-		strings.HasPrefix(id, "grid-sell-"+sym+"-") ||
-		strings.HasPrefix(id, "grid-seed-"+sym+"-")
+
+	if strings.HasPrefix(id, "grid-buy-"+sym+"-") ||
+        strings.HasPrefix(id, "grid-sell-"+sym+"-") ||
+        strings.HasPrefix(id, "grid-seed-"+sym+"-") {
+        return true
+    }
+
+	parts := strings.Split(id, "-")
+    return len(parts) >= 5 &&
+        parts[0] == "grid" &&
+        (parts[1] == "buy" || parts[1] == "sell") &&
+        parts[3] == sym
+
 }
 
 func filterGridOrdersBySymbol(orders []Order, symbol string) []Order {
@@ -4266,7 +4288,9 @@ func (b *Bot) Performance(ctx context.Context) (PerformanceSummary, error) {
 			unrealized += qty * (cur - avg)
 		}
 	}
-	realized := totalPnL - unrealized
+	b.mu.RLock()
+	realized := b.globalRealizedPnL
+	b.mu.RUnlock()
 	return PerformanceSummary{
 		Period:        "7D",
 		InitialEquity: periodEquity,

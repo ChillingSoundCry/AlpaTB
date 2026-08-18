@@ -1,0 +1,11 @@
+{
+  "halted": true,
+  "reason": "MOD exposure 50.00% exceeds limit 50.00%",
+  "session_day": "2026-08-17",
+  "session_equity": 86840.23,
+  "high_water_equity": 86854.27,
+  "daily_loss_pct": 0.0010460589521699391,
+  "drawdown_pct": 0.001207539940178009,
+  "gross_exposure_pct": 0.5558901336366745,
+  "updated_at": "2026-08-17T15:03:56Z"
+}

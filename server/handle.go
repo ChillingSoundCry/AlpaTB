@@ -1078,9 +1078,9 @@ func StartTrade() {
 	client := process.NewAlpacaClient(cfg)
 	bot := process.NewBot(client, cfg.Interval)
 
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("LEU", 5, 25)))
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("MOD", 5, 25)))
-	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("IONQ", 5, 25)))
+	//bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("CW", 1, 0)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("MOD", 5, 0)))
+	bot.RegisterStrategy(process.NewGridStrategy(client, defaultGridConfig("FLNC", 50, 0)))
 
 	ctx := context.Background()
 	if err := bot.Start(ctx); err != nil {
