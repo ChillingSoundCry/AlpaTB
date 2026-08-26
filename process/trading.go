@@ -28,7 +28,7 @@ const (
 	maxErrorLogLen      = 200
 	maxSnapshots        = 2000
 	maxTradeRecords     = 10000
-	processBuildVersion = "grid-live-safe-v6"
+	processBuildVersion = "grid-4h-regime-gtc-v7"
 
 	priceStaleThreshold = 45 * time.Second
 	priceRESTTimeout    = 5 * time.Second
@@ -36,7 +36,7 @@ const (
 	tradePreferenceWindow = 20 * time.Second
 	maxQuoteSpreadPct     = 0.03
 
-	indicatorCacheTTL = 1 * time.Minute
+	indicatorCacheTTL = 5 * time.Minute
 	ma20ValueCacheTTL = 30 * time.Minute
 	riskStateCacheTTL = 1 * time.Minute
 )
@@ -57,8 +57,10 @@ type Config struct {
 }
 
 func LoadConfig() Config {
-	apiKey := strings.TrimSpace(os.Getenv("APCA_API_KEY_ID"))
-	apiSecret := strings.TrimSpace(os.Getenv("APCA_API_SECRET_KEY"))
+	apiKey := "PKZAHMV7MKL6ZSDXWZG7CJ7IZO"
+	apiSecret := "CkJvxb51vdkZjRgBGDLvzDrzEjSCPkv9p6VGga9vbAiX"
+	//apiKey := strings.TrimSpace(os.Getenv("APCA_API_KEY_ID"))
+	//apiSecret := strings.TrimSpace(os.Getenv("APCA_API_SECRET_KEY"))
 	if apiKey == "" || apiSecret == "" {
 		log.Fatal("missing APCA_API_KEY_ID or APCA_API_SECRET_KEY environment variables")
 	}
@@ -823,6 +825,65 @@ type GridConfig struct {
 	MaxSeedPremiumPct     float64 // 市价高于中心过多时不追种子仓，默认 0.5%
 	MaxOpenBuyOrders      int     // 同一策略最多同时存在的买单，默认 min(levels, 3)
 	AllowOrdersWhenClosed bool    // 默认 false，仅在正常交易时段创建或重建订单
+
+	// 4H regime controls. The grid anchor changes only after a confirmed regime
+	// transition; ordinary price drift and a new trading day do not rebuild it.
+	RegimeTimeframe             string
+	RegimeFastEMAPeriod         int
+	RegimeSlowEMAPeriod         int
+	RegimeATRPeriod             int
+	RegimeADXPeriod             int
+	RegimeTrendADX              float64
+	RegimeRangeADX              float64
+	RegimeBreakoutLookback      int
+	RegimeBreakoutATRMultiplier float64
+	RegimeConfirmBars           int
+	RegimeRefreshInterval       time.Duration
+	BullBuyLevels               int
+	UseDayOrders                bool   // false => GTC; retained only as an explicit escape hatch
+	GridStateFile               string // persists the active 4H anchor across restarts
+}
+
+type gridRegime string
+
+const (
+	gridRegimeRange gridRegime = "range"
+	gridRegimeBull  gridRegime = "bull_breakout"
+	gridRegimeBear  gridRegime = "bear_breakdown"
+)
+
+type fourHourSnapshot struct {
+	Regime       gridRegime
+	BarTime      time.Time
+	Close        float64
+	FastEMA      float64
+	SlowEMA      float64
+	ATR          float64
+	ADX          float64
+	PlusDI       float64
+	MinusDI      float64
+	BreakoutHigh float64
+	BreakoutLow  float64
+	Center       float64
+	Spacing      float64
+	Reason       string
+}
+
+type gridPersistentState struct {
+	Version     int        `json:"version"`
+	Symbol      string     `json:"symbol"`
+	Regime      gridRegime `json:"regime"`
+	Center      float64    `json:"center"`
+	Spacing     float64    `json:"spacing"`
+	LastBarTime string     `json:"last_bar_time"`
+	UpdatedAt   string     `json:"updated_at"`
+}
+
+type gridInventoryLot struct {
+	BuyOrderID string
+	Qty        float64
+	EntryPrice float64
+	BoughtAt   time.Time
 }
 
 type GridStrategy struct {
@@ -872,6 +933,12 @@ type GridStrategy struct {
 	cachedMACDHist     float64
 	adxMode            string
 	entryFilterState   string
+
+	regime             gridRegime
+	regimeSnapshot     fourHourSnapshot
+	regimeCheckedAt    time.Time
+	regimeStateLoaded  bool
+	inventoryLots      []gridInventoryLot
 }
 
 type orderIntent struct {
@@ -981,14 +1048,59 @@ func NewGridStrategy(client *AlpacaClient, cfg GridConfig) *GridStrategy {
 	if cfg.MinBearishBuyLevel <= 0 {
 		cfg.MinBearishBuyLevel = minInt(3, cfg.Levels)
 	}
+	if strings.TrimSpace(cfg.RegimeTimeframe) == "" {
+		cfg.RegimeTimeframe = "4Hour"
+	}
+	if cfg.RegimeFastEMAPeriod <= 0 {
+		cfg.RegimeFastEMAPeriod = 20
+	}
+	if cfg.RegimeSlowEMAPeriod <= cfg.RegimeFastEMAPeriod {
+		cfg.RegimeSlowEMAPeriod = 50
+	}
+	if cfg.RegimeATRPeriod <= 0 {
+		cfg.RegimeATRPeriod = 14
+	}
+	if cfg.RegimeADXPeriod <= 0 {
+		cfg.RegimeADXPeriod = 14
+	}
+	if cfg.RegimeTrendADX <= 0 {
+		cfg.RegimeTrendADX = 25
+	}
+	if cfg.RegimeRangeADX <= 0 || cfg.RegimeRangeADX >= cfg.RegimeTrendADX {
+		cfg.RegimeRangeADX = 18
+	}
+	if cfg.RegimeBreakoutLookback < 5 {
+		cfg.RegimeBreakoutLookback = 20
+	}
+	if cfg.RegimeBreakoutATRMultiplier <= 0 {
+		cfg.RegimeBreakoutATRMultiplier = 0.25
+	}
+	if cfg.RegimeConfirmBars < 1 {
+		cfg.RegimeConfirmBars = 2
+	}
+	if cfg.RegimeRefreshInterval <= 0 {
+		cfg.RegimeRefreshInterval = 5 * time.Minute
+	}
+	if cfg.BullBuyLevels <= 0 || cfg.BullBuyLevels > cfg.Levels {
+		cfg.BullBuyLevels = minInt(3, cfg.Levels)
+	}
+	if strings.TrimSpace(cfg.GridStateFile) == "" {
+		mode := "unknown"
+		if client != nil {
+			mode = client.TradingMode()
+		}
+		cfg.GridStateFile = "grid_state_" + mode + "_" + strings.ToLower(strings.TrimSpace(cfg.Symbol)) + ".json"
+	}
 
-	return &GridStrategy{
+	g := &GridStrategy{
 		BaseStrategy:     BaseStrategy{client: client},
 		cfg:              cfg,
 		currentSpacing:   cfg.SpacingPct,
 		pendingOrders:    make(map[string]time.Time),
 		uncertainIntents: make(map[string]orderIntent),
 	}
+	g.loadGridState()
+	return g
 }
 
 func (g *GridStrategy) Name() string {
@@ -997,7 +1109,93 @@ func (g *GridStrategy) Name() string {
 
 func (g *GridStrategy) Symbol() string { return g.cfg.Symbol }
 
+func (g *GridStrategy) gridTimeInForce() string {
+	if g.cfg.UseDayOrders {
+		return "day"
+	}
+	return "gtc"
+}
+
+func (g *GridStrategy) loadGridState() {
+	path := strings.TrimSpace(g.cfg.GridStateFile)
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("grid %s state read failed: %v", g.cfg.Symbol, err)
+		}
+		return
+	}
+	var state gridPersistentState
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("grid %s state decode failed: %v", g.cfg.Symbol, err)
+		return
+	}
+	if state.Version != 2 || !strings.EqualFold(state.Symbol, g.cfg.Symbol) || state.Center <= 0 || state.Spacing <= 0 {
+		log.Printf("grid %s ignoring incompatible persistent state", g.cfg.Symbol)
+		return
+	}
+	switch state.Regime {
+	case gridRegimeRange, gridRegimeBull, gridRegimeBear:
+	default:
+		return
+	}
+	g.regime = state.Regime
+	g.centerPrice = state.Center
+	g.currentSpacing = state.Spacing
+	g.initialized = true
+	g.regimeStateLoaded = true
+	if parsed, err := time.Parse(time.RFC3339, state.LastBarTime); err == nil {
+		g.regimeSnapshot.BarTime = parsed
+	}
+}
+
+func (g *GridStrategy) persistGridStateLocked() {
+	path := strings.TrimSpace(g.cfg.GridStateFile)
+	if path == "" || g.centerPrice <= 0 || g.currentSpacing <= 0 || g.regime == "" {
+		return
+	}
+	state := gridPersistentState{
+		Version:     2,
+		Symbol:      strings.ToUpper(strings.TrimSpace(g.cfg.Symbol)),
+		Regime:      g.regime,
+		Center:      g.centerPrice,
+		Spacing:     g.currentSpacing,
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if !g.regimeSnapshot.BarTime.IsZero() {
+		state.LastBarTime = g.regimeSnapshot.BarTime.Format(time.RFC3339)
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("grid %s state encode failed: %v", g.cfg.Symbol, err)
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("grid %s state write failed: %v", g.cfg.Symbol, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("grid %s state replace failed: %v", g.cfg.Symbol, err)
+	}
+}
+
 func (g *GridStrategy) Config() map[string]interface{} {
+	g.mu.Lock()
+	regime := g.regime
+	regimeSnapshot := g.regimeSnapshot
+	activeCenter := g.centerPrice
+	activeSpacing := g.currentSpacing
+	lotCount := len(g.inventoryLots)
+	lotQty := 0.0
+	for _, lot := range g.inventoryLots {
+		lotQty += lot.Qty
+	}
+	g.mu.Unlock()
+
 	g.ma20Mu.Lock()
 	ma20Allowed := g.ma20CacheAllow
 	ma20Value := g.ma20Value
@@ -1055,6 +1253,37 @@ func (g *GridStrategy) Config() map[string]interface{} {
 		"max_seed_premium_pct":     g.cfg.MaxSeedPremiumPct,
 		"max_open_buy_orders":      g.cfg.MaxOpenBuyOrders,
 		"allow_orders_when_closed": g.cfg.AllowOrdersWhenClosed,
+		"regime_timeframe":                    g.cfg.RegimeTimeframe,
+		"regime_fast_ema_period":              g.cfg.RegimeFastEMAPeriod,
+		"regime_slow_ema_period":              g.cfg.RegimeSlowEMAPeriod,
+		"regime_atr_period":                   g.cfg.RegimeATRPeriod,
+		"regime_adx_period":                   g.cfg.RegimeADXPeriod,
+		"regime_trend_adx":                    g.cfg.RegimeTrendADX,
+		"regime_range_adx":                    g.cfg.RegimeRangeADX,
+		"regime_breakout_lookback":            g.cfg.RegimeBreakoutLookback,
+		"regime_breakout_atr_multiplier":      g.cfg.RegimeBreakoutATRMultiplier,
+		"regime_confirm_bars":                 g.cfg.RegimeConfirmBars,
+		"regime_refresh_interval":             g.cfg.RegimeRefreshInterval.String(),
+		"bull_buy_levels":                     g.cfg.BullBuyLevels,
+		"grid_order_time_in_force":            g.gridTimeInForce(),
+		"active_4h_regime":                    string(regime),
+		"active_4h_center":                    activeCenter,
+		"active_4h_spacing_pct":               activeSpacing,
+		"inventory_lot_count":                 lotCount,
+		"inventory_lot_qty":                   lotQty,
+		"regime_4h_close":                     regimeSnapshot.Close,
+		"regime_4h_fast_ema":                  regimeSnapshot.FastEMA,
+		"regime_4h_slow_ema":                  regimeSnapshot.SlowEMA,
+		"regime_4h_atr":                       regimeSnapshot.ATR,
+		"regime_4h_adx":                       regimeSnapshot.ADX,
+		"regime_4h_plus_di":                   regimeSnapshot.PlusDI,
+		"regime_4h_minus_di":                  regimeSnapshot.MinusDI,
+		"regime_4h_breakout_high":             regimeSnapshot.BreakoutHigh,
+		"regime_4h_breakout_low":              regimeSnapshot.BreakoutLow,
+		"regime_reason":                       regimeSnapshot.Reason,
+	}
+	if !regimeSnapshot.BarTime.IsZero() {
+		cfg["regime_4h_bar_time"] = regimeSnapshot.BarTime.Format(time.RFC3339)
 	}
 
 	cfg["ma20_allowed"] = ma20Allowed
@@ -1161,6 +1390,235 @@ func (g *GridStrategy) loadCompletedMA20(ctx context.Context, now time.Time) (fl
 	return sum / float64(valid), nil
 }
 
+func parseBarTime(raw string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw))
+	if err == nil {
+		return parsed.UTC(), nil
+	}
+	parsed, err = time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parsed.UTC(), nil
+}
+
+func (g *GridStrategy) completedFourHourBars(ctx context.Context, now time.Time) ([]Bar, error) {
+	end := now.UTC()
+	start := end.AddDate(0, 0, -180)
+	bars, err := g.client.GetBars(ctx, g.cfg.Symbol, g.cfg.RegimeTimeframe, start, end, 1000)
+	if err != nil {
+		return nil, err
+	}
+	completed := make([]Bar, 0, len(bars))
+	for _, bar := range bars {
+		if bar.Open <= 0 || bar.High <= 0 || bar.Low <= 0 || bar.Close <= 0 {
+			continue
+		}
+		barTime, err := parseBarTime(bar.Time)
+		if err != nil {
+			continue
+		}
+		// Historical endpoints can include the currently-forming aggregate. Never
+		// let an unfinished 4H candle switch the live trading regime. The final
+		// regular-session aggregate is shorter than four hours, so cap it at 16:00
+		// New York time instead of waiting until 17:30.
+		barEnd := barTime.Add(4 * time.Hour)
+		if ny, locationErr := time.LoadLocation("America/New_York"); locationErr == nil {
+			localStart := barTime.In(ny)
+			marketOpen := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), 9, 30, 0, 0, ny)
+			marketClose := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), 16, 0, 0, 0, ny)
+			if !localStart.Before(marketOpen) && localStart.Before(marketClose) && barEnd.After(marketClose.UTC()) {
+				barEnd = marketClose.UTC()
+			}
+		}
+		if barEnd.After(end) {
+			continue
+		}
+		completed = append(completed, bar)
+	}
+	return completed, nil
+}
+
+func highestHigh(bars []Bar) float64 {
+	value := 0.0
+	for _, bar := range bars {
+		if bar.High > value {
+			value = bar.High
+		}
+	}
+	return value
+}
+
+func lowestLow(bars []Bar) float64 {
+	value := 0.0
+	for _, bar := range bars {
+		if bar.Low <= 0 {
+			continue
+		}
+		if value <= 0 || bar.Low < value {
+			value = bar.Low
+		}
+	}
+	return value
+}
+
+func (g *GridStrategy) fourHourCandidate(bars []Bar, index int) (gridRegime, fourHourSnapshot) {
+	if index < 1 || index >= len(bars) {
+		return "", fourHourSnapshot{}
+	}
+	needed := maxInt(g.cfg.RegimeSlowEMAPeriod, g.cfg.RegimeBreakoutLookback+1)
+	needed = maxInt(needed, g.cfg.RegimeADXPeriod+2)
+	needed = maxInt(needed, g.cfg.RegimeATRPeriod+1)
+	if index+1 < needed {
+		return "", fourHourSnapshot{}
+	}
+
+	series := bars[:index+1]
+	last := bars[index]
+	fastEMA := computeEMA(series, g.cfg.RegimeFastEMAPeriod)
+	slowEMA := computeEMA(series, g.cfg.RegimeSlowEMAPeriod)
+	atr := computeATR(series, g.cfg.RegimeATRPeriod)
+	adx, plusDI, minusDI := computeADX(series, g.cfg.RegimeADXPeriod)
+	lookbackStart := index - g.cfg.RegimeBreakoutLookback
+	if lookbackStart < 0 {
+		lookbackStart = 0
+	}
+	prior := bars[lookbackStart:index]
+	breakoutHigh := highestHigh(prior)
+	breakoutLow := lowestLow(prior)
+	buffer := atr * g.cfg.RegimeBreakoutATRMultiplier
+	emaGapPct := 0.0
+	if last.Close > 0 {
+		emaGapPct = math.Abs(fastEMA-slowEMA) / last.Close
+	}
+
+	breakoutUp := breakoutHigh > 0 && last.Close > breakoutHigh+buffer
+	breakoutDown := breakoutLow > 0 && last.Close < breakoutLow-buffer
+	strongBull := fastEMA > slowEMA && plusDI > minusDI && adx >= g.cfg.RegimeTrendADX && last.Close >= fastEMA
+	strongBear := fastEMA < slowEMA && minusDI > plusDI && adx >= g.cfg.RegimeTrendADX && last.Close <= fastEMA
+
+	mode := gridRegime("")
+	reason := "4h neutral; keep previous regime"
+	switch {
+	case strongBull && (breakoutUp || emaGapPct >= 0.005):
+		mode = gridRegimeBull
+		if breakoutUp {
+			reason = "4h close confirmed above breakout channel with bullish EMA/ADX"
+		} else {
+			reason = "4h bullish EMA/ADX continuation"
+		}
+	case strongBear && (breakoutDown || emaGapPct >= 0.005):
+		mode = gridRegimeBear
+		if breakoutDown {
+			reason = "4h close confirmed below breakout channel with bearish EMA/ADX"
+		} else {
+			reason = "4h bearish EMA/ADX continuation"
+		}
+	case adx <= g.cfg.RegimeRangeADX || emaGapPct <= 0.003:
+		mode = gridRegimeRange
+		reason = "4h ADX/EMA compression confirmed range regime"
+	}
+
+	center := fastEMA
+	if mode == gridRegimeRange && fastEMA > 0 && slowEMA > 0 {
+		center = (fastEMA + slowEMA) / 2
+	}
+	if center <= 0 {
+		center = last.Close
+	}
+	spacing := g.cfg.SpacingPct
+	if last.Close > 0 && atr > 0 {
+		spacing = atr / last.Close * g.cfg.ATRMultiplier
+	}
+	if g.cfg.MinSpacingPct > 0 && spacing < g.cfg.MinSpacingPct {
+		spacing = g.cfg.MinSpacingPct
+	}
+	if g.cfg.MaxSpacingPct > 0 && spacing > g.cfg.MaxSpacingPct {
+		spacing = g.cfg.MaxSpacingPct
+	}
+	if spacing <= 0 {
+		spacing = 0.01
+	}
+	barTime, _ := parseBarTime(last.Time)
+	return mode, fourHourSnapshot{
+		Regime:       mode,
+		BarTime:      barTime,
+		Close:        last.Close,
+		FastEMA:      fastEMA,
+		SlowEMA:      slowEMA,
+		ATR:          atr,
+		ADX:          adx,
+		PlusDI:       plusDI,
+		MinusDI:      minusDI,
+		BreakoutHigh: breakoutHigh,
+		BreakoutLow:  breakoutLow,
+		Center:       center,
+		Spacing:      spacing,
+		Reason:       reason,
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (g *GridStrategy) refreshFourHourRegime(ctx context.Context) (bool, error) {
+	now := time.Now().UTC()
+	if !g.regimeCheckedAt.IsZero() && now.Sub(g.regimeCheckedAt) < g.cfg.RegimeRefreshInterval {
+		return false, nil
+	}
+	g.regimeCheckedAt = now
+	bars, err := g.completedFourHourBars(ctx, now)
+	if err != nil {
+		return false, err
+	}
+	minimum := maxInt(g.cfg.RegimeSlowEMAPeriod, g.cfg.RegimeBreakoutLookback+1)
+	minimum = maxInt(minimum, g.cfg.RegimeADXPeriod+2) + g.cfg.RegimeConfirmBars
+	if len(bars) < minimum {
+		return false, fmt.Errorf("grid %s requires at least %d completed 4h bars, got %d", g.cfg.Symbol, minimum, len(bars))
+	}
+
+	lastIndex := len(bars) - 1
+	_, latest := g.fourHourCandidate(bars, lastIndex)
+	if latest.BarTime.IsZero() {
+		return false, errors.New("latest completed 4h bar is unusable")
+	}
+	if latest.BarTime.Equal(g.regimeSnapshot.BarTime) && g.regimeSnapshot.Close > 0 {
+		return false, nil
+	}
+
+	confirmed := gridRegime("")
+	for offset := 0; offset < g.cfg.RegimeConfirmBars; offset++ {
+		candidate, _ := g.fourHourCandidate(bars, lastIndex-offset)
+		if candidate == "" {
+			confirmed = ""
+			break
+		}
+		if offset == 0 {
+			confirmed = candidate
+		} else if candidate != confirmed {
+			confirmed = ""
+			break
+		}
+	}
+	if g.regime == "" {
+		g.regime = gridRegimeRange
+	}
+	changed := confirmed != "" && confirmed != g.regime
+	if changed {
+		g.regime = confirmed
+		latest.Reason = fmt.Sprintf("regime changed to %s after %d completed 4h bars: %s", confirmed, g.cfg.RegimeConfirmBars, latest.Reason)
+	} else if confirmed == "" {
+		latest.Reason = "4h confirmation incomplete; existing regime retained"
+	}
+	latest.Regime = g.regime
+	g.regimeSnapshot = latest
+	return changed, nil
+}
+
 func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1192,6 +1650,7 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 	if math.Abs(position.Qty) > 1e-9 && position.Side == "short" {
 		return fmt.Errorf("grid %s is long-only but account position is short", g.cfg.Symbol)
 	}
+	g.syncInventoryLotsWithPosition(position)
 
 	pendingBuyQty := 0.0
 	openBuyOrders := 0
@@ -1209,97 +1668,93 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 		log.Printf("grid %s risk-state refresh failed; using in-memory values: %v", g.cfg.Symbol, err)
 	}
 
+	regimeChanged, regimeErr := g.refreshFourHourRegime(ctx)
+	if regimeErr != nil {
+		if !g.initialized {
+			return fmt.Errorf("grid %s cannot initialize 4h regime: %w", g.cfg.Symbol, regimeErr)
+		}
+		log.Printf("grid %s 4h regime refresh failed; retaining %s grid: %v", g.cfg.Symbol, g.regime, regimeErr)
+	}
+
 	if err := g.refreshIndicatorSnapshot(ctx); err != nil {
-		log.Printf("grid %s indicator refresh failed: %v", g.cfg.Symbol, err)
+		log.Printf("grid %s 4h indicator refresh failed; using retained values: %v", g.cfg.Symbol, err)
 	}
 
-	spacing := g.calculateSpacing(price)
-	g.currentSpacing = spacing
-	targetCenter := g.determineCenter(price)
+	targetCenter := g.regimeSnapshot.Center
 	if targetCenter <= 0 {
-		targetCenter = price
+		targetCenter = g.determineCenter(price)
 	}
-	g.updateADXMode()
-
-	if g.rebuildPending {
-		if len(openOrders) > 0 {
-			if !g.lastRebuildAt.IsZero() && time.Since(g.lastRebuildAt) >= 30*time.Second {
-				if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
-					return err
-				}
-				g.lastRebuildAt = time.Now()
-			}
-			return nil
-		}
-		center := g.pendingCenter
-		pendingSpacing := g.pendingSpacing
-		g.rebuildPending = false
-		g.pendingCenter = 0
-		g.pendingSpacing = 0
-		if center <= 0 {
-			center = targetCenter
-		}
-		if pendingSpacing <= 0 {
-			pendingSpacing = spacing
-		}
-		return g.rebuildGrid(ctx, center, pendingSpacing, position, pendingBuyQty, openBuyOrders, parseFloatString(acct.BuyingPower), price)
+	spacing := g.regimeSnapshot.Spacing
+	if spacing <= 0 {
+		spacing = g.calculateSpacing(price)
 	}
 
 	if !g.initialized {
-		if len(openOrders) == 0 {
-			return g.rebuildGrid(ctx, targetCenter, spacing, position, pendingBuyQty, openBuyOrders, parseFloatString(acct.BuyingPower), price)
-		}
-		// After a process restart the old center is unknown. Do not mix the old
-		// orders with a new EMA/VWAP center; cancel the owned grid and rebuild only
-		// after Alpaca confirms that the old orders disappeared.
-		if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
-			return err
-		}
-		g.rebuildPending = true
-		g.pendingCenter = targetCenter
-		g.pendingSpacing = spacing
-		g.lastRebuildAt = time.Now()
-		return nil
-	}
-
-	centerUsed := g.centerPrice
-	if centerUsed <= 0 {
-		centerUsed = targetCenter
-	}
-	if centerUsed <= 0 {
-		centerUsed = price
-	}
-
-	priceDrift := math.Abs(price-centerUsed) / math.Max(centerUsed, 1e-9)
-	centerDrift := math.Abs(targetCenter-centerUsed) / math.Max(centerUsed, 1e-9)
-	centerMode := strings.ToLower(strings.TrimSpace(g.cfg.CenterMode))
-	recenterNeeded := centerDrift >= g.cfg.RecenterPct
-	if centerMode == "price" {
-		recenterNeeded = priceDrift >= g.cfg.RecenterPct
-	}
-	if recenterNeeded {
-		now := time.Now()
-		if g.cfg.RebuildCooldown <= 0 || g.lastRebuildAt.IsZero() || now.Sub(g.lastRebuildAt) >= g.cfg.RebuildCooldown {
-			if len(openOrders) == 0 {
-				return g.rebuildGrid(ctx, targetCenter, spacing, position, pendingBuyQty, openBuyOrders, parseFloatString(acct.BuyingPower), price)
-			}
+		// One-time migration: old DAY/1H orders have no durable 4H state or lot
+		// ownership. Remove them before writing v7 state. If the process stops
+		// during cancellation, the next start safely repeats this migration.
+		if len(openOrders) > 0 {
 			if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
 				return err
 			}
-			// Alpaca cancellation is asynchronous. Wait for the next Tick to confirm
-			// all old orders are gone before creating the replacement grid.
-			g.rebuildPending = true
-			g.pendingCenter = targetCenter
-			g.pendingSpacing = spacing
-			g.lastRebuildAt = now
+			return nil
+		}
+		if g.regime == "" {
+			g.regime = gridRegimeRange
+		}
+		g.centerPrice = targetCenter
+		g.currentSpacing = spacing
+		g.initialized = true
+		g.lastBuildAt = time.Now()
+		g.lastRebuildAt = g.lastBuildAt
+		g.persistGridStateLocked()
+		return g.rebuildGrid(ctx, g.centerPrice, g.currentSpacing, position, pendingBuyQty, openBuyOrders, parseFloatString(acct.BuyingPower), price)
+	}
+
+	if regimeChanged {
+		g.rebuildPending = true
+		g.pendingCenter = targetCenter
+		g.pendingSpacing = spacing
+	}
+	if g.rebuildPending {
+		oldCenter := g.centerPrice
+		cancelled, err := g.cancelEntryOrders(ctx, openOrders)
+		if err != nil {
+			return err
+		}
+		g.centerPrice = g.pendingCenter
+		g.currentSpacing = g.pendingSpacing
+		g.lastRebuildAt = time.Now()
+		g.rebuildPending = false
+		g.pendingCenter = 0
+		g.pendingSpacing = 0
+		g.persistGridStateLocked()
+		log.Printf("grid %s 4h regime switched to %s: center %.4f -> %.4f spacing=%.4f reason=%s", g.cfg.Symbol, g.regime, oldCenter, g.centerPrice, g.currentSpacing, g.regimeSnapshot.Reason)
+		if cancelled {
 			return nil
 		}
 	}
 
-	// Keep the active center stable until a full cancel-and-rebuild. Updating the
-	// in-memory center without repricing existing orders would mix two grids.
-	g.centerPrice = centerUsed
-	return g.maintainGrid(ctx, centerUsed, spacing, position, pendingBuyQty, openBuyOrders, openOrders, parseFloatString(acct.BuyingPower), price)
+	// No calendar-day or ordinary price-drift rebuild. The persisted anchor is
+	// changed only by a confirmed 4H regime transition.
+	return g.maintainGrid(ctx, g.centerPrice, g.currentSpacing, position, pendingBuyQty, openBuyOrders, openOrders, parseFloatString(acct.BuyingPower), price)
+}
+
+func (g *GridStrategy) cancelEntryOrders(ctx context.Context, orders []Order) (bool, error) {
+	cancelled := false
+	for _, order := range orders {
+		if !isGridOrderForSymbol(order, g.cfg.Symbol) || !strings.EqualFold(order.Side, "buy") {
+			continue
+		}
+		if err := g.client.CancelOrder(ctx, order.ID); err != nil {
+			if isHTTPStatusError(err, http.StatusNotFound) || isHTTPStatusError(err, http.StatusUnprocessableEntity) {
+				continue
+			}
+			return cancelled, fmt.Errorf("cancel grid entry order %s: %w", order.ID, err)
+		}
+		cancelled = true
+	}
+	return cancelled, nil
 }
 
 func (g *GridStrategy) cancelAllSymbolOrders(ctx context.Context, orders []Order) error {
@@ -1442,7 +1897,7 @@ func (g *GridStrategy) reserveBuyOrder(now time.Time, notional float64) {
 }
 
 func (g *GridStrategy) OnFill(orderID, side string, qty, price float64, at time.Time) {
-	if !strings.EqualFold(side, "buy") || qty <= 0 {
+	if qty <= 0 {
 		return
 	}
 	g.mu.Lock()
@@ -1450,28 +1905,94 @@ func (g *GridStrategy) OnFill(orderID, side string, qty, price float64, at time.
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	if at.After(g.lastBuyAt) {
-		g.lastBuyAt = at
+	switch strings.ToLower(strings.TrimSpace(side)) {
+	case "buy":
+		g.inventoryLots = append(g.inventoryLots, gridInventoryLot{
+			BuyOrderID: orderID,
+			Qty:        qty,
+			EntryPrice: price,
+			BoughtAt:   at,
+		})
+		if at.After(g.lastBuyAt) {
+			g.lastBuyAt = at
+		}
+		// Force a REST reconstruction soon so cancellations and partial fills are
+		// reflected in the reserved daily notional.
+		g.riskStateUpdatedAt = time.Time{}
+	case "sell":
+		g.consumeInventoryLots(qty, price)
 	}
-	// Force a REST reconstruction soon so cancellations and partial fills are
-	// reflected in the reserved daily notional.
-	g.riskStateUpdatedAt = time.Time{}
 }
 
-func (g *GridStrategy) protectedSellPrice(gridPrice, avgEntryPrice, currentPrice float64, level int) float64 {
-	floor := gridPrice
-	if avgEntryPrice > 0 {
-		floor = math.Max(floor, avgEntryPrice*(1+g.cfg.MinProfitPct))
+func (g *GridStrategy) lotTargetPrice(entryPrice float64) float64 {
+	if entryPrice <= 0 {
+		return 0
 	}
-	if currentPrice > 0 {
-		floor = math.Max(floor, currentPrice*(1+g.cfg.SellMarketBufferPct))
+	// Never raise an old lot's target because of today's market price or a new
+	// 4H center. A GTC order at this target can capture a next-day gap up.
+	return normalizeLimitPrice(entryPrice*(1+g.cfg.MinProfitPct), "sell")
+}
+
+func (g *GridStrategy) syncInventoryLotsWithPosition(position positionState) {
+	targetQty := math.Max(0, position.Qty)
+	trackedQty := 0.0
+	for _, lot := range g.inventoryLots {
+		trackedQty += math.Max(0, lot.Qty)
 	}
-	// If several levels are lifted to the same protection floor, separate them
-	// by one legal price increment so every level can coexist.
-	if level > 1 {
-		floor += float64(level-1) * priceIncrement(floor)
+	if targetQty <= 1e-9 {
+		g.inventoryLots = nil
+		return
 	}
-	return normalizeLimitPrice(floor, "sell")
+	if trackedQty+1e-6 < targetQty {
+		g.inventoryLots = append(g.inventoryLots, gridInventoryLot{
+			Qty:        targetQty - trackedQty,
+			EntryPrice: position.AvgEntryPrice,
+			BoughtAt:   time.Now().UTC(),
+		})
+		return
+	}
+	if trackedQty <= targetQty+1e-6 {
+		return
+	}
+	remaining := targetQty
+	trimmed := make([]gridInventoryLot, 0, len(g.inventoryLots))
+	for _, lot := range g.inventoryLots {
+		if remaining <= 1e-9 || lot.Qty <= 0 {
+			continue
+		}
+		keep := math.Min(lot.Qty, remaining)
+		lot.Qty = keep
+		trimmed = append(trimmed, lot)
+		remaining -= keep
+	}
+	g.inventoryLots = trimmed
+}
+
+func (g *GridStrategy) consumeInventoryLots(qty, sellPrice float64) {
+	remaining := qty
+	for remaining > 1e-9 && len(g.inventoryLots) > 0 {
+		best := -1
+		bestEntry := math.MaxFloat64
+		for i, lot := range g.inventoryLots {
+			if lot.Qty <= 0 {
+				continue
+			}
+			target := g.lotTargetPrice(lot.EntryPrice)
+			if target > 0 && sellPrice+priceIncrement(sellPrice)/2 >= target && lot.EntryPrice < bestEntry {
+				best = i
+				bestEntry = lot.EntryPrice
+			}
+		}
+		if best < 0 {
+			best = 0
+		}
+		used := math.Min(remaining, g.inventoryLots[best].Qty)
+		g.inventoryLots[best].Qty -= used
+		remaining -= used
+		if g.inventoryLots[best].Qty <= 1e-9 {
+			g.inventoryLots = append(g.inventoryLots[:best], g.inventoryLots[best+1:]...)
+		}
+	}
 }
 
 func (g *GridStrategy) quantityForPrice(price, fallbackQty float64) float64 {
@@ -1537,61 +2058,86 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 	g.lastBuildAt = now
 	g.lastRebuildAt = now
 	g.pendingOrders = make(map[string]time.Time)
+	g.persistGridStateLocked()
 
-	seedQty := g.quantityForPrice(currentPrice, g.cfg.SeedQty)
-	if position.Qty <= 0 && seedQty > 0 && g.allowBuyAtLevel(ctx, 0, currentPrice) {
-		maxSeedPrice := center * (1 + g.cfg.MaxSeedPremiumPct)
-		if currentPrice > maxSeedPrice {
-			g.logBuyBlocked(now, fmt.Sprintf("seed chase protection; market=%.4f max_seed=%.4f center=%.4f", currentPrice, maxSeedPrice, center))
-		} else {
-			seedPrice := normalizeLimitPrice(currentPrice, "buy")
-			notional := seedPrice * seedQty
-			if g.canAddPosition(position.Qty, pendingBuyQty, seedQty, seedPrice, currentPrice) && buyingPower >= notional && g.canBuy(now, notional, openBuyOrders) {
-				newBP, placed := g.placeSeedBuyIfSafe(ctx, seedPrice, seedQty, buyingPower, openBuyOrders)
-				if placed {
-					_ = newBP
-					return nil
-				}
-			}
-		}
+	return g.maintainGrid(ctx, center, spacing, position, pendingBuyQty, openBuyOrders, nil, buyingPower, currentPrice)
+}
+
+func (g *GridStrategy) activeBuyLevelLimit() int {
+	switch g.regime {
+	case gridRegimeBear:
+		return 0
+	case gridRegimeBull:
+		return minInt(g.cfg.BullBuyLevels, g.cfg.Levels)
+	default:
+		return g.cfg.Levels
+	}
+}
+
+type exitTarget struct {
+	Price float64
+	Qty   float64
+}
+
+func (g *GridStrategy) maintainExitOrders(ctx context.Context, position positionState, openOrders []Order) error {
+	g.syncInventoryLotsWithPosition(position)
+	if position.Qty <= 1e-9 {
+		return nil
 	}
 
-	availableSellQty := position.Qty
-	usedBuyPrices := map[string]bool{}
-	usedSellPrices := map[string]bool{}
-	for level := 1; level <= g.cfg.Levels; level++ {
-		off := float64(level) * spacing
-		buyPrice := center * (1 - off)
-		if currentPrice > 0 {
-			buyPrice = math.Min(buyPrice, currentPrice*(1-g.cfg.BuyMarketBufferPct))
+	desired := make(map[string]exitTarget)
+	for _, lot := range g.inventoryLots {
+		price := g.lotTargetPrice(lot.EntryPrice)
+		// MinPrice/MaxPrice constrain new entries only. Never suppress the exit of
+		// an already-owned lot because its profitable target is outside that band.
+		if price <= 0 || lot.Qty <= 0 {
+			continue
 		}
-		gridSellPrice := center * (1 + off)
-		buyKey := formatLimitPrice(buyPrice, "buy")
+		key := formatLimitPrice(price, "sell")
+		target := desired[key]
+		target.Price = price
+		target.Qty += lot.Qty
+		desired[key] = target
+	}
 
-		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
-			buyQty := g.quantityForPrice(buyPrice, g.cfg.QtyPerOrder)
-			if buyQty > 0 && g.canAddPosition(position.Qty, pendingBuyQty, buyQty, buyPrice, currentPrice) {
-				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, buyQty, buyingPower, openBuyOrders)
-				if placed {
-					buyingPower = newBP
-					pendingBuyQty += buyQty
-					openBuyOrders++
-					usedBuyPrices[buyKey] = true
-				}
-			}
+	openByPrice := make(map[string]float64)
+	reservedSellQty := 0.0
+	for _, order := range openOrders {
+		if !strings.EqualFold(order.Side, "sell") || !isActiveOrderStatus(order.Status) {
+			continue
 		}
+		remaining := remainingOrderQty(order)
+		price := parseFloatString(order.LimitPrice)
+		if remaining <= 0 || price <= 0 {
+			continue
+		}
+		key := formatLimitPrice(price, "sell")
+		openByPrice[key] += remaining
+		reservedSellQty += remaining
+		delete(g.pendingOrders, "sell-"+key)
+	}
+	if reservedSellQty > position.Qty+1e-6 {
+		return fmt.Errorf("grid %s refuses to add exits: open sell qty %.6f exceeds position %.6f", g.cfg.Symbol, reservedSellQty, position.Qty)
+	}
 
-		if availableSellQty > 0 {
-			sellPrice := g.protectedSellPrice(gridSellPrice, position.AvgEntryPrice, currentPrice, level)
-			sellKey := formatLimitPrice(sellPrice, "sell")
-			if !usedSellPrices[sellKey] && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
-				qty := math.Min(math.Max(1, g.quantityForPrice(sellPrice, g.cfg.QtyPerOrder)), availableSellQty)
-				if qty > 0 && g.placeSellIfSafe(ctx, level, sellPrice, qty) {
-					availableSellQty -= qty
-					usedSellPrices[sellKey] = true
-				}
-			}
+	available := math.Max(0, position.Qty-reservedSellQty)
+	targets := make([]exitTarget, 0, len(desired))
+	for key, target := range desired {
+		target.Qty = math.Max(0, target.Qty-openByPrice[key])
+		if target.Qty > 1e-9 {
+			targets = append(targets, target)
 		}
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Price < targets[j].Price })
+	for level, target := range targets {
+		qty := math.Min(target.Qty, available)
+		if qty <= 1e-9 {
+			break
+		}
+		if !g.placeSellIfSafe(ctx, level+1, target.Price, qty) {
+			continue
+		}
+		available -= qty
 	}
 	return nil
 }
@@ -1606,68 +2152,55 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 	}
 	g.currentSpacing = spacing
 
-	// A new buy fill can raise the average entry price while older sell orders
-	// are still resting below the new cost floor. Cancel the entire owned grid
-	// first; replacements are created only after cancellation is confirmed.
-	baseSellFloor := g.protectedSellPrice(0, position.AvgEntryPrice, currentPrice, 1)
-	unsafeSellFound := false
-	for _, order := range openOrders {
-		if !strings.EqualFold(order.Side, "sell") || remainingOrderQty(order) <= 0 {
-			continue
-		}
-		limitPrice := parseFloatString(order.LimitPrice)
-		if baseSellFloor > 0 && limitPrice+priceIncrement(limitPrice)/2 < baseSellFloor {
-			unsafeSellFound = true
-			log.Printf("grid %s canceling unsafe sell: order=%s limit=%.4f required_floor=%.4f", g.cfg.Symbol, order.ID, limitPrice, baseSellFloor)
-			break
-		}
+	if err := g.maintainExitOrders(ctx, position, openOrders); err != nil {
+		return err
 	}
-	if unsafeSellFound {
-		if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
-			return err
-		}
-		g.rebuildPending = true
-		g.pendingCenter = center
-		g.pendingSpacing = spacing
-		g.lastRebuildAt = now
+
+	levelLimit := g.activeBuyLevelLimit()
+	if levelLimit <= 0 {
+		g.setEntryFilterState("4h_bear_breakdown_buy_side_disabled")
 		return nil
 	}
 
 	openBuyPrices := map[string]bool{}
-	openSellPrices := map[string]bool{}
-	openSellQty := 0.0
 	for _, order := range openOrders {
-		side := strings.ToLower(strings.TrimSpace(order.Side))
+		if !strings.EqualFold(order.Side, "buy") || !isActiveOrderStatus(order.Status) {
+			continue
+		}
 		price := parseFloatString(order.LimitPrice)
 		if price <= 0 {
 			continue
 		}
-		priceKey := formatLimitPrice(price, side)
-		delete(g.pendingOrders, side+"-"+priceKey)
-		remaining := remainingOrderQty(order)
-		if remaining <= 0 {
-			continue
-		}
-		switch side {
-		case "buy":
-			openBuyPrices[priceKey] = true
-		case "sell":
-			openSellPrices[priceKey] = true
-			openSellQty += remaining
+		priceKey := formatLimitPrice(price, "buy")
+		openBuyPrices[priceKey] = true
+		delete(g.pendingOrders, "buy-"+priceKey)
+	}
+
+	seedQty := g.quantityForPrice(currentPrice, g.cfg.SeedQty)
+	if position.Qty <= 0 && openBuyOrders == 0 && seedQty > 0 && g.allowBuyAtLevel(ctx, 0, currentPrice) {
+		maxSeedPrice := center * (1 + g.cfg.MaxSeedPremiumPct)
+		if currentPrice > maxSeedPrice {
+			g.logBuyBlocked(now, fmt.Sprintf("seed chase protection; market=%.4f max_seed=%.4f center=%.4f", currentPrice, maxSeedPrice, center))
+		} else {
+			seedPrice := normalizeLimitPrice(currentPrice, "buy")
+			notional := seedPrice * seedQty
+			if g.canAddPosition(position.Qty, pendingBuyQty, seedQty, seedPrice, currentPrice) && buyingPower >= notional && g.canBuy(now, notional, openBuyOrders) {
+				newBP, placed := g.placeSeedBuyIfSafe(ctx, seedPrice, seedQty, buyingPower, openBuyOrders)
+				if placed {
+					buyingPower = newBP
+					return nil
+				}
+			}
 		}
 	}
 
-	availableSellQty := math.Max(0, position.Qty-openSellQty)
 	usedBuyPrices := map[string]bool{}
-	usedSellPrices := map[string]bool{}
-
-	for level := 1; level <= g.cfg.Levels; level++ {
+	for level := 1; level <= levelLimit; level++ {
 		off := float64(level) * spacing
 		buyPrice := center * (1 - off)
 		if currentPrice > 0 {
 			buyPrice = math.Min(buyPrice, currentPrice*(1-g.cfg.BuyMarketBufferPct))
 		}
-		gridSellPrice := center * (1 + off)
 		buyKey := formatLimitPrice(buyPrice, "buy")
 
 		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
@@ -1679,18 +2212,6 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 					pendingBuyQty += buyQty
 					openBuyOrders++
 					usedBuyPrices[buyKey] = true
-				}
-			}
-		}
-
-		if availableSellQty > 0 {
-			sellPrice := g.protectedSellPrice(gridSellPrice, position.AvgEntryPrice, currentPrice, level)
-			sellKey := formatLimitPrice(sellPrice, "sell")
-			if !usedSellPrices[sellKey] && !openSellPrices[sellKey] && sellPrice > 0 && (g.cfg.MaxPrice <= 0 || sellPrice <= g.cfg.MaxPrice) {
-				qty := math.Min(math.Max(1, g.quantityForPrice(sellPrice, g.cfg.QtyPerOrder)), availableSellQty)
-				if qty > 0 && g.placeSellIfSafe(ctx, level, sellPrice, qty) {
-					availableSellQty -= qty
-					usedSellPrices[sellKey] = true
 				}
 			}
 		}
@@ -1720,7 +2241,7 @@ func (g *GridStrategy) placeSeedBuyIfSafe(ctx context.Context, price, qty, buyin
 		Qty:           fmt.Sprintf("%.6f", qty),
 		Side:          "buy",
 		Type:          "limit",
-		TimeInForce:   "day",
+		TimeInForce:   g.gridTimeInForce(),
 		LimitPrice:    priceKey,
 		ClientOrderID: clientOrderID,
 	})
@@ -1759,7 +2280,7 @@ func (g *GridStrategy) placeBuyIfSafe(ctx context.Context, level int, price, qty
 		Qty:           fmt.Sprintf("%.6f", qty),
 		Side:          "buy",
 		Type:          "limit",
-		TimeInForce:   "day",
+		TimeInForce:   g.gridTimeInForce(),
 		LimitPrice:    priceKey,
 		ClientOrderID: clientOrderID,
 	})
@@ -1784,13 +2305,13 @@ func (g *GridStrategy) placeSellIfSafe(ctx context.Context, level int, price, qt
 		return false
 	}
 
-	clientOrderID := g.clientOrderIDFor(key, "sell", level)
+	clientOrderID := g.clientOrderIDFor(key, "exit", level)
 	_, err := g.client.PlaceOrderIdempotent(ctx, OrderRequest{
 		Symbol:        g.cfg.Symbol,
 		Qty:           fmt.Sprintf("%.6f", qty),
 		Side:          "sell",
 		Type:          "limit",
-		TimeInForce:   "day",
+		TimeInForce:   g.gridTimeInForce(),
 		LimitPrice:    priceKey,
 		ClientOrderID: clientOrderID,
 	})
@@ -1865,10 +2386,9 @@ func (g *GridStrategy) refreshIndicatorSnapshot(ctx context.Context) error {
 	}
 	g.indicatorMu.Unlock()
 
-	end := time.Now().UTC()
-	start := end.AddDate(0, 0, -30)
-
-	bars, err := g.client.GetBars(ctx, g.cfg.Symbol, "1Hour", start, end, 1000)
+	// Reuse the same completed 4H candles as the regime engine. This prevents a
+	// partial intraday bar from loosening/tightening entry filters mid-candle.
+	bars, err := g.completedFourHourBars(ctx, time.Now().UTC())
 	ttl := indicatorCacheTTL
 	if g.cfg.RebuildCooldown > 0 && g.cfg.RebuildCooldown < ttl {
 		ttl = g.cfg.RebuildCooldown
@@ -2014,6 +2534,14 @@ func (g *GridStrategy) updateADXMode() string {
 }
 
 func (g *GridStrategy) allowBuyAtLevel(ctx context.Context, level int, currentPrice float64) bool {
+	if g.regime == gridRegimeBear {
+		g.setEntryFilterState("4h_bear_breakdown_buy_side_disabled")
+		return false
+	}
+	if g.regime == gridRegimeBull && level > g.activeBuyLevelLimit() {
+		g.setEntryFilterState("4h_bull_breakout_shallow_entries_only")
+		return false
+	}
 	if !g.cfg.UseTrendFilter || g.cfg.EntryFilterMode == "off" {
 		return true
 	}
@@ -2433,17 +2961,17 @@ func isGridOrderForSymbol(order Order, symbol string) bool {
 	sym := strings.ToLower(strings.TrimSpace(symbol))
 
 	if strings.HasPrefix(id, "grid-buy-"+sym+"-") ||
-        strings.HasPrefix(id, "grid-sell-"+sym+"-") ||
-        strings.HasPrefix(id, "grid-seed-"+sym+"-") {
-        return true
-    }
+		strings.HasPrefix(id, "grid-sell-"+sym+"-") ||
+		strings.HasPrefix(id, "grid-exit-"+sym+"-") ||
+		strings.HasPrefix(id, "grid-seed-"+sym+"-") {
+		return true
+	}
 
 	parts := strings.Split(id, "-")
-    return len(parts) >= 5 &&
-        parts[0] == "grid" &&
-        (parts[1] == "buy" || parts[1] == "sell") &&
-        parts[3] == sym
-
+	return len(parts) >= 5 &&
+		parts[0] == "grid" &&
+		(parts[1] == "buy" || parts[1] == "sell" || parts[1] == "exit") &&
+		parts[3] == sym
 }
 
 func filterGridOrdersBySymbol(orders []Order, symbol string) []Order {
@@ -3118,6 +3646,7 @@ func detectStrategyName(clientOrderID, symbol string) string {
 	switch {
 	case strings.HasPrefix(id, "grid-buy-"),
 		strings.HasPrefix(id, "grid-sell-"),
+		strings.HasPrefix(id, "grid-exit-"),
 		strings.HasPrefix(id, "grid-seed-"):
 		return "grid-" + sym
 	case strings.HasPrefix(id, "open-sell-"),
@@ -4698,3 +5227,4 @@ func (b *Bot) LiquidateAll(ctx context.Context) error {
 		}
 	}
 }
+
