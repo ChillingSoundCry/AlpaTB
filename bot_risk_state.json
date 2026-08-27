@@ -1,11 +1,11 @@
 {
   "halted": false,
   "reason": "",
-  "session_day": "2026-08-26",
-  "session_equity": 86115.52,
-  "high_water_equity": 86115.52,
-  "daily_loss_pct": 0.00023654272772213295,
-  "drawdown_pct": 0.00023654272772213295,
-  "gross_exposure_pct": 0.05664802256573106,
-  "updated_at": "2026-08-26T15:45:07Z"
+  "session_day": "2026-08-27",
+  "session_equity": 86194.63,
+  "high_water_equity": 86321.53,
+  "daily_loss_pct": 0,
+  "drawdown_pct": 0.0003586590738138197,
+  "gross_exposure_pct": 0.05878440714900828,
+  "updated_at": "2026-08-27T09:11:39Z"
 }

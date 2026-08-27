@@ -1046,7 +1046,7 @@ func defaultGridConfig(symbol string, qtyPerOrder, maxQty float64) process.GridC
 		QtyPerOrder:           qtyPerOrder,
 		SeedQty:               qtyPerOrder,
 		OrderNotional:         250,
-		MaxPositionNotional:   1200,
+		MaxPositionNotional:   0,
 		RecenterPct:           0.05,
 		MaxPositionQty:        maxQty,
 		UseTrendFilter:        true,

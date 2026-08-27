@@ -28,7 +28,8 @@ const (
 	maxErrorLogLen      = 200
 	maxSnapshots        = 2000
 	maxTradeRecords     = 10000
-	processBuildVersion = "grid-4h-regime-gtc-v7"
+	processBuildVersion = "grid-4h-regime-gtc-v8"
+	gridStateVersion    = 3
 
 	priceStaleThreshold = 45 * time.Second
 	priceRESTTimeout    = 5 * time.Second
@@ -39,6 +40,8 @@ const (
 	indicatorCacheTTL = 5 * time.Minute
 	ma20ValueCacheTTL = 30 * time.Minute
 	riskStateCacheTTL = 1 * time.Minute
+	maxFourHourBarAge = 7 * 24 * time.Hour
+	maxBarsPages       = 1000
 )
 
 // -----------------------
@@ -1131,7 +1134,7 @@ func (g *GridStrategy) loadGridState() {
 		log.Printf("grid %s state decode failed: %v", g.cfg.Symbol, err)
 		return
 	}
-	if state.Version != 2 || !strings.EqualFold(state.Symbol, g.cfg.Symbol) || state.Center <= 0 || state.Spacing <= 0 {
+	if state.Version != gridStateVersion || !strings.EqualFold(state.Symbol, g.cfg.Symbol) || state.Center <= 0 || state.Spacing <= 0 {
 		log.Printf("grid %s ignoring incompatible persistent state", g.cfg.Symbol)
 		return
 	}
@@ -1156,7 +1159,7 @@ func (g *GridStrategy) persistGridStateLocked() {
 		return
 	}
 	state := gridPersistentState{
-		Version:     2,
+		Version:     gridStateVersion,
 		Symbol:      strings.ToUpper(strings.TrimSpace(g.cfg.Symbol)),
 		Regime:      g.regime,
 		Center:      g.centerPrice,
@@ -1434,6 +1437,19 @@ func (g *GridStrategy) completedFourHourBars(ctx context.Context, now time.Time)
 		}
 		completed = append(completed, bar)
 	}
+	if len(completed) == 0 {
+		return nil, errors.New("no completed 4h bars returned")
+	}
+	latestTime, err := parseBarTime(completed[len(completed)-1].Time)
+	if err != nil {
+		return nil, fmt.Errorf("latest completed 4h bar has invalid timestamp: %w", err)
+	}
+	if end.Sub(latestTime) > maxFourHourBarAge {
+		return nil, fmt.Errorf(
+			"stale 4h market data: latest bar=%s now=%s maximum_age=%s",
+			latestTime.Format(time.RFC3339), end.Format(time.RFC3339), maxFourHourBarAge,
+		)
+	}
 	return completed, nil
 }
 
@@ -1671,7 +1687,13 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 		if !g.initialized {
 			return fmt.Errorf("grid %s cannot initialize 4h regime: %w", g.cfg.Symbol, regimeErr)
 		}
-		log.Printf("grid %s 4h regime refresh failed; retaining %s grid: %v", g.cfg.Symbol, g.regime, regimeErr)
+		log.Printf("grid %s 4h regime refresh failed; buy side disabled while exits remain protected: %v", g.cfg.Symbol, regimeErr)
+		g.setEntryFilterState("4h_market_data_unavailable_buy_side_disabled")
+		if err := g.maintainExitOrders(ctx, position, openOrders); err != nil {
+			return err
+		}
+		_, err := g.cancelEntryOrders(ctx, openOrders)
+		return err
 	}
 
 	if err := g.refreshIndicatorSnapshot(ctx); err != nil {
@@ -1688,14 +1710,17 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 	}
 
 	if !g.initialized {
-		// One-time migration: old DAY/1H orders have no durable 4H state or lot
-		// ownership. Remove them before writing v7 state. If the process stops
-		// during cancellation, the next start safely repeats this migration.
+		// One-time migration: remove stale entry orders before writing the new
+		// state, but preserve GTC exits. Existing exits retain the exact lot-level
+		// take-profit prices that protect overnight inventory.
 		if len(openOrders) > 0 {
-			if err := g.cancelAllSymbolOrders(ctx, openOrders); err != nil {
+			cancelled, err := g.cancelEntryOrders(ctx, openOrders)
+			if err != nil {
 				return err
 			}
-			return nil
+			if cancelled {
+				return nil
+			}
 		}
 		if g.regime == "" {
 			g.regime = gridRegimeRange
@@ -1706,7 +1731,7 @@ func (g *GridStrategy) Tick(ctx context.Context, acct *Account, clock *Clock) er
 		g.lastBuildAt = time.Now()
 		g.lastRebuildAt = g.lastBuildAt
 		g.persistGridStateLocked()
-		return g.rebuildGrid(ctx, g.centerPrice, g.currentSpacing, position, pendingBuyQty, openBuyOrders, parseFloatString(acct.BuyingPower), price)
+		return g.rebuildGrid(ctx, g.centerPrice, g.currentSpacing, position, pendingBuyQty, openBuyOrders, openOrders, parseFloatString(acct.BuyingPower), price)
 	}
 
 	if regimeChanged {
@@ -2004,6 +2029,40 @@ func (g *GridStrategy) quantityForPrice(price, fallbackQty float64) float64 {
 	return fallbackQty
 }
 
+func (g *GridStrategy) capBuyQuantity(desiredQty, positionQty, pendingQty, orderPrice, currentPrice, buyingPower float64) float64 {
+	if desiredQty <= 0 || orderPrice <= 0 {
+		return 0
+	}
+	g.resetDailyStatsIfNeeded(time.Now())
+	qty := math.Floor(desiredQty + 1e-9)
+	capByNotional := func(remaining, price float64) {
+		if remaining < 0 {
+			remaining = 0
+		}
+		if price > 0 {
+			qty = math.Min(qty, math.Floor(remaining/price+1e-9))
+		}
+	}
+
+	capByNotional(buyingPower, orderPrice)
+	if g.cfg.DailyBuyNotionalLimit > 0 {
+		capByNotional(g.cfg.DailyBuyNotionalLimit-g.dailyBuyNotional, orderPrice)
+	}
+	if g.cfg.MaxPositionQty > 0 {
+		remainingQty := g.cfg.MaxPositionQty - math.Max(0, positionQty) - math.Max(0, pendingQty)
+		qty = math.Min(qty, math.Floor(math.Max(0, remainingQty)+1e-9))
+	}
+	mark := math.Max(orderPrice, currentPrice)
+	if g.cfg.MaxPositionNotional > 0 && mark > 0 {
+		used := (math.Max(0, positionQty) + math.Max(0, pendingQty)) * mark
+		capByNotional(g.cfg.MaxPositionNotional-used, mark)
+	}
+	if qty < 1 {
+		return 0
+	}
+	return qty
+}
+
 func (g *GridStrategy) canAddPosition(positionQty, pendingQty, addQty, orderPrice, currentPrice float64) bool {
 	projectedQty := math.Max(0, positionQty) + math.Max(0, pendingQty) + math.Max(0, addQty)
 	if g.cfg.MaxPositionQty > 0 && projectedQty > g.cfg.MaxPositionQty+1e-9 {
@@ -2041,7 +2100,7 @@ func (g *GridStrategy) clearOrderIntent(key string) {
 	delete(g.uncertainIntents, key)
 }
 
-func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64, position positionState, pendingBuyQty float64, openBuyOrders int, buyingPower, currentPrice float64) error {
+func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64, position positionState, pendingBuyQty float64, openBuyOrders int, openOrders []Order, buyingPower, currentPrice float64) error {
 	now := time.Now()
 	if spacing <= 0 {
 		spacing = g.cfg.SpacingPct
@@ -2058,7 +2117,7 @@ func (g *GridStrategy) rebuildGrid(ctx context.Context, center, spacing float64,
 	g.pendingOrders = make(map[string]time.Time)
 	g.persistGridStateLocked()
 
-	return g.maintainGrid(ctx, center, spacing, position, pendingBuyQty, openBuyOrders, nil, buyingPower, currentPrice)
+	return g.maintainGrid(ctx, center, spacing, position, pendingBuyQty, openBuyOrders, openOrders, buyingPower, currentPrice)
 }
 
 func (g *GridStrategy) activeBuyLevelLimit() int {
@@ -2181,8 +2240,14 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 			g.logBuyBlocked(now, fmt.Sprintf("seed chase protection; market=%.4f max_seed=%.4f center=%.4f", currentPrice, maxSeedPrice, center))
 		} else {
 			seedPrice := normalizeLimitPrice(currentPrice, "buy")
+			desiredSeedQty := seedQty
+			seedQty = g.capBuyQuantity(seedQty, position.Qty, pendingBuyQty, seedPrice, currentPrice, buyingPower)
+			if desiredSeedQty > 0 && seedQty <= 0 {
+				g.setEntryFilterState("risk_capacity_below_one_share")
+				g.logBuyBlocked(now, fmt.Sprintf("remaining risk capacity cannot fund one whole share; buying_power=%.2f position_qty=%.6f pending_qty=%.6f max_position_notional=%.2f", buyingPower, position.Qty, pendingBuyQty, g.cfg.MaxPositionNotional))
+			}
 			notional := seedPrice * seedQty
-			if g.canAddPosition(position.Qty, pendingBuyQty, seedQty, seedPrice, currentPrice) && buyingPower >= notional && g.canBuy(now, notional, openBuyOrders) {
+			if seedQty > 0 && g.canAddPosition(position.Qty, pendingBuyQty, seedQty, seedPrice, currentPrice) && buyingPower >= notional && g.canBuy(now, notional, openBuyOrders) {
 				newBP, placed := g.placeSeedBuyIfSafe(ctx, seedPrice, seedQty, buyingPower, openBuyOrders)
 				if placed {
 					buyingPower = newBP
@@ -2202,7 +2267,14 @@ func (g *GridStrategy) maintainGrid(ctx context.Context, center, spacing float64
 		buyKey := formatLimitPrice(buyPrice, "buy")
 
 		if g.allowBuyAtLevel(ctx, level, currentPrice) && !usedBuyPrices[buyKey] && !openBuyPrices[buyKey] && buyPrice > 0 && (g.cfg.MinPrice <= 0 || buyPrice >= g.cfg.MinPrice) {
-			buyQty := g.quantityForPrice(buyPrice, g.cfg.QtyPerOrder)
+			desiredBuyQty := g.quantityForPrice(buyPrice, g.cfg.QtyPerOrder)
+			buyQty := desiredBuyQty
+			buyQty = g.capBuyQuantity(buyQty, position.Qty, pendingBuyQty, buyPrice, currentPrice, buyingPower)
+			if desiredBuyQty > 0 && buyQty <= 0 {
+				g.setEntryFilterState("risk_capacity_below_one_share")
+				g.logBuyBlocked(now, fmt.Sprintf("remaining risk capacity cannot fund one whole share; buying_power=%.2f position_qty=%.6f pending_qty=%.6f max_position_notional=%.2f", buyingPower, position.Qty, pendingBuyQty, g.cfg.MaxPositionNotional))
+				continue
+			}
 			if buyQty > 0 && g.canAddPosition(position.Qty, pendingBuyQty, buyQty, buyPrice, currentPrice) {
 				newBP, placed := g.placeBuyIfSafe(ctx, level, buyPrice, buyQty, buyingPower, openBuyOrders)
 				if placed {
@@ -5003,20 +5075,45 @@ func (c *AlpacaClient) GetBars(ctx context.Context, symbol, timeframe string, st
 		q.Set("end", end.UTC().Format(time.RFC3339))
 	}
 	if limit > 0 {
+		if limit > 10000 {
+			limit = 10000
+		}
 		q.Set("limit", strconv.Itoa(limit))
 	}
+	q.Set("sort", "asc")
 	if strings.TrimSpace(c.feed) != "" {
 		q.Set("feed", strings.TrimSpace(c.feed))
 	}
-	u.RawQuery = q.Encode()
-	var resp BarsResponse
-	if err := c.doJSON(ctx, http.MethodGet, u.String(), nil, &resp); err != nil {
-		return nil, err
+
+	allBars := make([]Bar, 0)
+	seenTokens := make(map[string]struct{})
+	pageToken := ""
+	for page := 0; page < maxBarsPages; page++ {
+		if pageToken == "" {
+			q.Del("page_token")
+		} else {
+			q.Set("page_token", pageToken)
+		}
+		u.RawQuery = q.Encode()
+		var resp BarsResponse
+		if err := c.doJSON(ctx, http.MethodGet, u.String(), nil, &resp); err != nil {
+			return nil, err
+		}
+		allBars = append(allBars, resp.Bars...)
+		next := strings.TrimSpace(resp.NextPageToken)
+		if next == "" {
+			sort.SliceStable(allBars, func(i, j int) bool {
+				return allBars[i].Time < allBars[j].Time
+			})
+			return allBars, nil
+		}
+		if _, duplicate := seenTokens[next]; duplicate {
+			return nil, fmt.Errorf("bars pagination returned a repeated page token after %d pages", page+1)
+		}
+		seenTokens[next] = struct{}{}
+		pageToken = next
 	}
-	sort.SliceStable(resp.Bars, func(i, j int) bool {
-		return resp.Bars[i].Time < resp.Bars[j].Time
-	})
-	return resp.Bars, nil
+	return nil, fmt.Errorf("bars pagination exceeded %d pages", maxBarsPages)
 }
 
 func (b *Bot) GetHistoricalBars(ctx context.Context, symbol string) ([]BarView, error) {
